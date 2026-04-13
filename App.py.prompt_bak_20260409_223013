@@ -1,0 +1,3313 @@
+"""
+Офлайн AI Мэдлэгийн Сан — Hybrid RAG (100% офлайн)
+Vector + BM25 + Keyword хайлт | ONNX INT8 | Streaming
+"""
+
+import os, re, sys, time, json, pickle, hashlib, shutil, subprocess
+import warnings, logging, threading, unicodedata
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+import gradio as gr
+import numpy as np
+
+warnings.filterwarnings("ignore")
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+# ── Тохиргоо ────────────────────────────────────────────────
+CACHE_DIR        = Path.home() / ".rag_cache"
+LOCAL_MODEL_DIR  = CACHE_DIR / "local_models"
+INDEX_DIR        = CACHE_DIR / "indexes"
+
+CHUNK_SIZE       = 600
+CHUNK_OVERLAP    = 80
+MIN_CHUNK_LEN    = 10
+MAX_FILE_MB      = 50
+FILE_TIMEOUT_SEC = 30
+DEFAULT_TOP_K    = 5
+EMBED_MAX_LEN    = 256
+BM25_WEIGHT      = 0.50
+VECTOR_WEIGHT    = 0.35
+KEYWORD_BOOST    = 1.20
+OLLAMA_HOST      = "http://localhost:11434"
+OLLAMA_TIMEOUT   = 600    # том загварт 1200 болгоно
+SEMANTIC_REFERENCE_MODEL = "sentence-transformers/all-distilroberta-v1"
+
+# ── Enhanced Search Тохиргоо ─────────────────────────────────
+WEIGHT_PROFILES = {
+    "factual":  {"bm25": 0.50, "vector": 0.25, "keyword": 0.25},
+    "semantic": {"bm25": 0.20, "vector": 0.55, "keyword": 0.25},
+    "exact":    {"bm25": 0.20, "vector": 0.10, "keyword": 0.70},
+    "mixed":    {"bm25": 0.35, "vector": 0.35, "keyword": 0.30},
+}
+CONFIDENCE_THRESHOLD = 0.65  # Найдвартай гэж үзэх score
+
+IGNORE_DIRS = {
+    # Version control
+    ".git", ".svn", ".hg",
+    # Python environments & caches
+    "venv", ".venv", "env", ".env", "virtualenv",
+    "node_modules", "__pycache__", ".mypy_cache", ".ruff_cache",
+    ".pytest_cache", ".tox", ".nox", ".eggs", ".cache",
+    "site-packages", "dist-packages",
+    # Build & dist
+    "dist", "build", "egg-info", ".egg-info", "sdist", "wheels",
+    # Test directories (хамгийн том шалтгаан!)
+    "tests", "test", "testing", "test_data", "testdata", "test-data",
+    "fixtures", "fixture", "testfiles", "test_files",
+    "ReplayData", "cassettes", "recordings", "snapshots",
+    "functional",  # pylint test data
+    # IDE & editor
+    ".idea", ".vscode", ".vs", ".eclipse",
+    # OS junk
+    "$RECYCLE.BIN", "$Recycle.Bin", ".Trash", ".DS_Store",
+    "Thumbs.db", "desktop.ini",
+    # Documentation build
+    "_build", "_static", "_templates",
+    # Misc
+    ".github", ".gitlab", ".circleci",
+    "coverage", "htmlcov", ".coverage",
+    "migrations", "locale",
+}
+
+# Filename patterns to skip (test fixtures, Recycle Bin, templates)
+SKIP_FILENAME_PREFIXES = {"$I", "$R", "~$"}  # Recycle Bin + temp Office files
+SKIP_FILENAME_CONTAINS = {"{{", "}}", ".test.", "_test_", "fixture"}
+
+SKIP_EXTENSIONS = {
+    ".py",".js",".ts",".jsx",".tsx",".java",".c",".cpp",".h",".cs",
+    ".go",".rs",".rb",".php",".swift",".kt",".sh",".bat",".ps1",".lua",
+    ".json",".yaml",".yml",".toml",".ini",".cfg",".env",".xml",".config",
+    ".html",".htm",".css",".scss",
+    ".png",".jpg",".jpeg",".gif",".bmp",".svg",".ico",".webp",
+    ".mp4",".mp3",".avi",".mov",".wav",".zip",".tar",".gz",".rar",".7z",
+    ".exe",".dll",".so",".db",".sqlite",".pkl",".bin",".npy",".lock",
+    # Нэмэлт: test/config файлууд
+    ".pyc",".pyo",".whl",".egg",".spec",".map",".min.js",".min.css",
+}
+
+EMBED_MODELS = {
+    "multilingual-fast": {
+        "hf_name": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        "dim": 384, "desc": "Олон хэл хурдан (470MB) — Монгол", "multilingual": True,
+    },
+    "multilingual-quality": {
+        "hf_name": "intfloat/multilingual-e5-small",
+        "dim": 384, "desc": "Олон хэл чанартай (470MB) — Монгол",
+        "multilingual": True, "use_prefix": True,
+    },
+    "ultra-fast": {
+        "hf_name": "sentence-transformers/paraphrase-MiniLM-L3-v2",
+        "dim": 384, "desc": "Хамгийн хурдан (17MB) — зөвхөн Англи", "multilingual": False,
+    },
+    "fast": {
+        "hf_name": "sentence-transformers/all-MiniLM-L6-v2",
+        "dim": 384, "desc": "Тэнцвэртэй (80MB) — зөвхөн Англи", "multilingual": False,
+    },
+}
+DEFAULT_EMBED = "multilingual-fast"
+RERANKER_HF   = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+_GR_VERSION          = tuple(int(x) for x in gr.__version__.split(".")[:2])
+_USE_MESSAGES_FORMAT = _GR_VERSION >= (4, 0)
+
+
+# ══════════════════════════════════════════════════════════════
+# FIX #1: Unicode filename normalization
+# ══════════════════════════════════════════════════════════════
+def _normalize_filename(name: str) -> str:
+    """Normalize Unicode filename to NFC form for consistent matching."""
+    return unicodedata.normalize("NFC", name) if name else name
+
+def _normalize_path(p) -> Path:
+    """Normalize a Path's filename component to NFC Unicode."""
+    p = Path(p)
+    normalized_name = _normalize_filename(p.name)
+    if normalized_name != p.name:
+        return p.parent / normalized_name if not p.exists() else p
+    return p
+
+
+# ── GPU илрүүлэлт ───────────────────────────────────────────
+_TORCH_CUDA_INSTALL = (
+    "pip install torch torchvision --index-url "
+    "https://download.pytorch.org/whl/cu121"
+)
+
+def _detect_device():
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name  = torch.cuda.get_device_name(0)
+            total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            print(f"  GPU: {name} ({total:.1f}GB VRAM)")
+            return torch.device("cuda"), "cuda", total
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            print("  GPU: Apple MPS")
+            return torch.device("mps"), "mps", 0.0
+        ver = getattr(torch.version, "cuda", None)
+        is_cpu_build = "+cpu" in torch.__version__ or ver is None
+        if is_cpu_build:
+            print(f"  ⚠️  CPU-only torch ({torch.__version__}) суусан байна.")
+            print(f"  GPU ашиглахын тулд:")
+            print(f"  {_TORCH_CUDA_INSTALL}")
+        else:
+            print(f"  CUDA={ver} байгаа ч GPU олдсонгүй — driver шалгана уу.")
+    except ImportError:
+        print("  torch суулгаагүй → pip install torch")
+    print("  CPU горимд ажиллана")
+    return None, "cpu", 0.0
+
+_DEVICE, _DEVICE_TYPE, _VRAM_GB = _detect_device()
+
+def _gpu_batch(bs):
+    if _DEVICE_TYPE == "cpu":  return bs
+    if _DEVICE_TYPE == "mps":  return min(bs*4, 512)
+    if _VRAM_GB >= 16:         return min(bs*8, 1024)
+    if _VRAM_GB >= 8:          return min(bs*4, 512)
+    if _VRAM_GB >= 4:          return min(bs*2, 256)
+    return bs
+
+def _gpu_str():
+    if _DEVICE_TYPE == "cuda": return f"CUDA ({_VRAM_GB:.1f}GB)"
+    if _DEVICE_TYPE == "mps":  return "Apple MPS"
+    return "CPU"
+
+def _cpu_info():
+    cores = os.cpu_count() or 4
+    try:
+        import psutil; ram = psutil.virtual_memory().total / (1024**3)
+    except ImportError: ram = 8.0
+    return cores, ram
+
+def _opt_batch():
+    _, ram = _cpu_info()
+    if ram < 8:  return 8
+    if ram < 16: return 16
+    if ram < 32: return 32
+    return 64
+
+def _opt_threads():
+    cores, _ = _cpu_info()
+    return max(1, min(cores//2, 4))
+
+def _embed_st_path(key):   return LOCAL_MODEL_DIR / EMBED_MODELS[key]["hf_name"].replace("/","_")
+def _embed_onnx_path(key): return LOCAL_MODEL_DIR / (EMBED_MODELS[key]["hf_name"].replace("/","_") + "_onnx")
+def _reranker_path():      return LOCAL_MODEL_DIR / RERANKER_HF.replace("/","_")
+def _check_available():    return {k: _embed_st_path(k).exists() for k in EMBED_MODELS}
+
+
+# ── Индекс файл менежмент ────────────────────────────────────
+def _sanitize_name(name):
+    name = re.sub(r'[\\/:*?"<>|]', "_", name.strip())
+    return re.sub(r'\s+', "_", name)[:80] or "default"
+
+def _index_base(name):
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    return str(INDEX_DIR / _sanitize_name(name))
+
+def list_saved_indexes():
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    return [f.stem for f in sorted(INDEX_DIR.glob("*.faiss"),
+            key=lambda x: x.stat().st_mtime, reverse=True)]
+
+def _index_info(name):
+    if not name or name == "(байхгүй)": return ""
+    p = Path(_index_base(name) + ".meta")
+    if not p.exists(): return ""
+    try:
+        with open(p,"rb") as f: meta = pickle.load(f)
+        n   = len(meta.get("chunks",[]))
+        key = meta.get("key","?")
+        fld = Path(meta.get("folder","?")).name
+        sat = meta.get("saved_at","")
+        ml  = " 🌐" if EMBED_MODELS.get(key,{}).get("multilingual") else ""
+        return f"{n:,} chunk | {key}{ml} | {fld}" + (f" | {sat}" if sat else "")
+    except Exception: return ""
+
+def _dd_and_info(selected=None):
+    saved = list_saved_indexes()
+    if not saved: return gr.update(choices=["(байхгүй)"], value="(байхгүй)"), ""
+    value = selected if (selected and selected in saved) else saved[0]
+    return gr.update(choices=saved, value=value), _index_info(value)
+
+
+# ── Model татах ──────────────────────────────────────────────
+def _download_embedding_models():
+    from sentence_transformers import SentenceTransformer
+    for key, info in EMBED_MODELS.items():
+        st_dir = _embed_st_path(key)
+        if st_dir.exists(): print(f"  {key}: бэлэн"); continue
+        print(f"  {key}: татаж байна...")
+        try:
+            SentenceTransformer(info["hf_name"]).save(str(st_dir))
+            print(f"     хадгалагдлаа")
+        except Exception as e:
+            print(f"     алдаа: {e}")
+
+def _download_reranker():
+    rp = _reranker_path()
+    if rp.exists(): print("  reranker: бэлэн"); return
+    print(f"  reranker: татаж байна...")
+    try:
+        from sentence_transformers import CrossEncoder
+        CrossEncoder(RERANKER_HF).save(str(rp)); print("     хадгалагдлаа")
+    except Exception as e: print(f"     алдаа: {e}")
+
+def _download_onnx_models():
+    try:
+        from optimum.onnxruntime import ORTModelForFeatureExtraction
+        from transformers import AutoTokenizer
+    except ImportError:
+        print("  ONNX алгасав (pip install optimum[onnxruntime])"); return
+
+    for key, info in EMBED_MODELS.items():
+        onnx_dir = _embed_onnx_path(key)
+        q8_path  = onnx_dir / "model_q8.onnx"
+        if q8_path.exists(): print(f"  onnx/{key}: бэлэн"); continue
+
+        print(f"  onnx/{key}: export хийж байна")
+        try:
+            ORTModelForFeatureExtraction.from_pretrained(info["hf_name"], export=True).save_pretrained(str(onnx_dir))
+            AutoTokenizer.from_pretrained(info["hf_name"]).save_pretrained(str(onnx_dir))
+            print("     export дууслаа")
+        except Exception as e: print(f"     алдаа: {e}"); continue
+
+        try:
+            from onnxruntime.quantization import quantize_dynamic, QuantType
+            src = onnx_dir / "model.onnx"
+            if src.exists():
+                print("     INT8 quantize хийж байна...")
+                quantize_dynamic(str(src), str(q8_path), weight_type=QuantType.QInt8, optimize_model=True)
+                print(f"     model_q8.onnx ({q8_path.stat().st_size//1024}KB)")
+        except Exception as e: print(f"     quantize алдаа: {e}")
+
+def download_all():
+    LOCAL_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    print("\n── Embedding ──"); _download_embedding_models()
+    print("\n── Reranker ──");  _download_reranker()
+    print("\n── ONNX ──");      _download_onnx_models()
+    print("\n✅ Бүх model бэлэн!")
+
+
+# ── Текст цэвэрлэгч ─────────────────────────────────────────
+_RE_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\ud800-\udfff]")
+def clean_text(t): return _RE_CTRL.sub("", t) if t else ""
+def safe_encode(t): return clean_text(t).encode("utf-8", errors="replace")
+
+
+# ══════════════════════════════════════════════════════════════
+# FIX #2: Improved PDF reader with full debug logging
+# ══════════════════════════════════════════════════════════════
+
+def read_txt(p):
+    for enc in ["utf-8","utf-16","cp1251","latin-1"]:
+        try: return clean_text(Path(p).read_text(encoding=enc))
+        except Exception: continue
+    return ""
+
+def read_pdf(p):
+    """
+    Enhanced PDF reader with 4-stage fallback + full debug logging:
+      1. PyMuPDF (fitz) — fastest, best for most PDFs
+      2. pdfplumber   — better for Japanese/CJK fonts and tables
+      3. pypdf        — broadest compatibility
+      4. Filename-based placeholder — ensures file is never silently dropped
+
+    ✅ DEBUG: каждый алхамыг консолд харуулна
+    """
+    fname = _normalize_filename(Path(p).name)
+    print(f"  📖 PDF уншиж байна: {fname}")
+
+    result = ""
+
+    # ── Stage 1: PyMuPDF ────────────────────────────────────
+    try:
+        import fitz
+        doc = fitz.open(p)
+        pages = []
+        for page in doc:
+            t = page.get_text("text")
+            if len(t.strip()) < 10:
+                try:
+                    lines = [" ".join(s.get("text","") for s in ln.get("spans",[]))
+                             for blk in page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE).get("blocks",[])
+                             for ln in blk.get("lines",[])]
+                    t = "\n".join(l for l in lines if l.strip())
+                except Exception: pass
+            if t.strip(): pages.append(t)
+        doc.close()
+        result = clean_text("\n\n".join(pages))
+        if len(result.strip()) >= 10:
+            print(f"     ✅ [Stage 1] PyMuPDF: {len(result):,} тэмдэгт, {len(pages)} хуудас")
+            return result
+        else:
+            print(f"     ⚠️  [Stage 1] PyMuPDF: хуудас уншигдсан ч текст хоосон ({len(result)} тэмдэгт) — дараагийн stage")
+    except ImportError:
+        print(f"     ❌ [Stage 1] PyMuPDF суулгаагүй → pip install pymupdf")
+    except Exception as e:
+        print(f"     ❌ [Stage 1] PyMuPDF алдаа: {e}")
+
+    # ── Stage 2: pdfplumber (CJK/Japanese fallback) ─────────
+    try:
+        import pdfplumber
+        pages = []
+        with pdfplumber.open(p) as pdf:
+            for pg in pdf.pages:
+                try:
+                    t = pg.extract_text() or ""
+                    if t.strip(): pages.append(t)
+                except Exception: pass
+        result = clean_text("\n".join(pages))
+        if len(result.strip()) >= 10:
+            print(f"     ✅ [Stage 2] pdfplumber: {len(result):,} тэмдэгт, {len(pages)} хуудас")
+            return result
+        else:
+            print(f"     ⚠️  [Stage 2] pdfplumber: текст хоосон ({len(result)} тэмдэгт) — дараагийн stage")
+    except ImportError:
+        print(f"     ℹ️  [Stage 2] pdfplumber суулгаагүй (CJK PDF-д хэрэгтэй) → pip install pdfplumber")
+    except Exception as e:
+        print(f"     ❌ [Stage 2] pdfplumber алдаа: {e}")
+
+    # ── Stage 3: pypdf ───────────────────────────────────────
+    try:
+        with open(p,"rb") as f:
+            header = f.read(4)
+        if header != b"%PDF":
+            print(f"     ❌ [Stage 3] Энэ файл PDF биш байна (header: {header})")
+            return ""
+        from pypdf import PdfReader
+        pages = []
+        reader = PdfReader(p, strict=False)
+        total_pages = len(reader.pages)
+        for pg in reader.pages:
+            try:
+                t = pg.extract_text() or ""
+                if t.strip(): pages.append(t)
+            except Exception as pe:
+                print(f"     ⚠️  [Stage 3] pypdf хуудас алдаа: {pe}")
+        result = clean_text("\n".join(pages))
+        if len(result.strip()) >= 10:
+            print(f"     ✅ [Stage 3] pypdf: {len(result):,} тэмдэгт, {len(pages)}/{total_pages} хуудас")
+            return result
+        else:
+            print(f"     ⚠️  [Stage 3] pypdf: {total_pages} хуудас байгаа ч текст гарсангүй ({len(result)} тэмдэгт)")
+            print(f"         → Зурган PDF байж магадгүй (scan хийсэн). OCR хэрэгтэй.")
+    except ImportError:
+        print(f"     ❌ [Stage 3] pypdf суулгаагүй → pip install pypdf")
+    except Exception as e:
+        print(f"     ❌ [Stage 3] pypdf алдаа: {e}")
+
+    # ── Stage 4: Placeholder (never silently drop) ───────────
+    name_clean = _normalize_filename(Path(p).stem).replace("_"," ").replace("-"," ")
+    try:
+        import fitz
+        doc = fitz.open(p)
+        n = len(doc)
+        doc.close()
+        if n > 0:
+            placeholder = f"[Зурган PDF] {name_clean} | {n} хуудас"
+            print(f"     ⚠️  [Stage 4] Placeholder буцааж байна: '{placeholder}'")
+            print(f"         → OCR ашиглахыг зөвлөж байна: pip install pytesseract")
+            return placeholder
+    except Exception:
+        pass
+
+    placeholder = f"[PDF уншигдсангүй] {name_clean}"
+    print(f"     ⚠️  [Stage 4] Бүх stage амжилтгүй. Placeholder: '{placeholder}'")
+    return placeholder
+
+def read_docx(p):
+    try:
+        from docx import Document
+        return clean_text("\n".join(pg.text for pg in Document(p).paragraphs))
+    except Exception as e: return f"[DOCX: {e}]"
+
+def read_csv(p):
+    try:
+        import pandas as pd
+        return clean_text(pd.read_csv(p).to_string(index=False))
+    except Exception as e: return f"[CSV: {e}]"
+
+def read_xlsx(p):
+    try:
+        import pandas as pd
+        return clean_text(pd.read_excel(p).to_string(index=False))
+    except Exception as e: return f"[XLSX: {e}]"
+
+READERS = {
+    ".txt":read_txt,".md":read_txt,".log":read_txt,".rst":read_txt,
+    ".pdf":read_pdf,".docx":read_docx,
+    ".csv":read_csv,".tsv":read_csv,
+    ".xlsx":read_xlsx,".xls":read_xlsx,
+}
+
+def _file_hash(p):
+    h = hashlib.md5()
+    try:
+        with open(p,"rb") as f:
+            for blk in iter(lambda: f.read(8192), b""): h.update(blk)
+    except Exception: pass
+    return h.hexdigest()
+
+
+# ══════════════════════════════════════════════════════════════
+# FIX #3: Improved _read_one with Unicode normalization
+# ══════════════════════════════════════════════════════════════
+
+def _read_one(fp):
+    fp = Path(fp)
+    ext = fp.suffix.lower()
+    if ext in SKIP_EXTENSIONS: return {"skip":True,"reason":"кодын файл","name":fp.name}
+    if ext not in READERS:     return {"skip":True,"reason":f"дэмжигдэхгүй ({ext})","name":fp.name}
+    try:
+        sz = fp.stat().st_size
+        if sz == 0: return {"skip":True,"reason":"хоосон","name":fp.name}
+        if sz > MAX_FILE_MB*1024*1024: return {"skip":True,"reason":f"том ({sz//1024//1024}MB)","name":fp.name}
+        t0 = time.perf_counter()
+        txt = (READERS[ext](str(fp)) or "").strip()
+        elapsed = time.perf_counter() - t0
+        if elapsed > 5.0:
+            print(f"  ⚠️ УДААН: {fp.name} — {elapsed:.1f}с ({sz//1024}KB)")
+        if not txt:
+            r = "PDF: текст олдсонгүй" if ext==".pdf" else "хоосон агуулга"
+            return {"skip":True,"reason":r,"name":fp.name}
+        if len(txt) < MIN_CHUNK_LEN: return {"skip":True,"reason":f"богино ({len(txt)}с)","name":fp.name}
+        normalized_name = _normalize_filename(fp.name)
+        return {"path":str(fp),"name":normalized_name,"text":txt,
+                "size":len(txt),"hash":_file_hash(str(fp))}
+    except PermissionError: return {"skip":True,"reason":"эрх байхгүй","name":fp.name}
+    except Exception as e:  return {"skip":True,"reason":str(e)[:80],"name":fp.name}
+
+def _should_skip_file(fp: Path) -> str:
+    name = fp.name
+    name_l = name.lower()
+
+    for prefix in SKIP_FILENAME_PREFIXES:
+        if name.startswith(prefix):
+            return f"recycle/temp ({prefix})"
+
+    for pat in SKIP_FILENAME_CONTAINS:
+        if pat in name:
+            return f"template/test ({pat})"
+
+    if re.match(r'^[A-Z][a-zA-Z]+\.[a-z]+[A-Z]', name):
+        return "test fixture (CamelCase.method)"
+
+    if (fp.suffix.lower() in {'.txt', '.rst'} and
+        '_' in name_l and
+        fp.stat().st_size < 5120 and
+        re.match(r'^[a-z][a-z0-9_]+\.(txt|rst)$', name_l) and
+        any(kw in name_l for kw in [
+            'invalid_', 'missing_', 'deprecated_', 'duplicate_',
+            'broad_', 'bad_', 'logging_', 'implicit_', 'inconsistent_',
+            'generic_alias', 'consider_', 'unnecessary_', 'assignment_',
+        ])):
+        return "linter test data"
+
+    if re.match(r'^(bom_|test-|test_)', name_l) and fp.stat().st_size < 5120:
+        return "encoding test"
+
+    return ""
+
+
+def load_documents(folder, progress=None):
+    folder = folder.strip().strip('"\'')
+    fp = Path(folder)
+    if not fp.exists(): return [], [f"Фолдер олдсонгүй: {folder}"]
+    _ignore_lower = {d.lower() for d in IGNORE_DIRS}
+    files = [f for f in fp.rglob("*")
+             if f.is_file()
+             and not any(p.name.lower() in _ignore_lower for p in f.parents)
+             and f.suffix.lower() not in SKIP_EXTENSIONS
+             and f.suffix.lower() in READERS]
+    if not files:
+        exts = {f.suffix.lower() for f in fp.rglob("*") if f.is_file()}
+        return [], [f"Файл байхгүй. Өргөтгөлүүд: {', '.join(sorted(exts)[:10])}"]
+
+    filtered, auto_skipped = [], []
+    for f in files:
+        reason = _should_skip_file(f)
+        if reason:
+            auto_skipped.append(f"{f.name} — {reason}")
+        else:
+            filtered.append(f)
+
+    if auto_skipped:
+        print(f"  🔍 Автомат шүүлт: {len(auto_skipped)} test/fixture файл алгасагдлаа")
+        if len(auto_skipped) <= 10:
+            for s in auto_skipped:
+                print(f"     • {s}")
+        else:
+            for s in auto_skipped[:5]:
+                print(f"     • {s}")
+            print(f"     ... +{len(auto_skipped)-5} файл")
+        print(f"  ✅ Үлдсэн: {len(filtered)} файл (таны бодит баримтууд)")
+
+    files = filtered
+
+    pdf_files = [f for f in files if f.suffix.lower() == ".pdf"]
+    if pdf_files:
+        print(f"\n  📄 PDF файлууд ({len(pdf_files)}) — дэлгэрэнгүй log доор харагдана:")
+        for pf in pdf_files:
+            print(f"     • {_normalize_filename(pf.name)} ({pf.stat().st_size // 1024}KB)")
+        print()
+    else:
+        print(f"  ℹ️  PDF файл олдсонгүй (фолдерт .pdf файл байгаа эсэхийг шалгана уу)")
+
+    docs, skipped, done, total = [], [], 0, len(files)
+    with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8, total)) as ex:
+        futs = {ex.submit(_read_one,f): f for f in files}
+        for fut in as_completed(futs):
+            f = futs[fut]; done += 1
+            if progress: progress(done/total*0.30, desc=f"📄 {done}/{total} — {f.name[:35]}")
+            try:
+                r = fut.result(timeout=FILE_TIMEOUT_SEC)
+                if r is None:       skipped.append(f"{f.name} — алдаа")
+                elif r.get("skip"): skipped.append(f"{r['name']} — {r['reason']}")
+                else:               docs.append(r)
+            except Exception as e: skipped.append(f"{f.name} — {str(e)[:50]}")
+
+    print(f"\n  {'─'*50}")
+    print(f"  📊 Уншилтын дүн:")
+    if docs:
+        print(f"  ✅ Амжилттай уншсан: {len(docs)} файл")
+        for d in docs:
+            print(f"     • {d['name']} ({d['size']:,} тэмдэгт)")
+    if skipped:
+        print(f"  ⚠️  Алгасагдсан: {len(skipped)}")
+        for s in skipped:
+            print(f"     • {s}")
+    print(f"  {'─'*50}\n")
+
+    return docs, skipped
+
+
+# ── Chunking ─────────────────────────────────────────────────
+_SEPS = [". ",".\n","!\n","?\n","\n\n","\n","; ",", "," "]
+
+def chunk_text(text, size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= size: return [text] if len(text) >= MIN_CHUNK_LEN else []
+    chunks, start = [], 0
+    while start < len(text):
+        end = start + size
+        if end < len(text):
+            for sep in _SEPS:
+                pos = text.rfind(sep, start+overlap, end)
+                if pos > start: end = pos+len(sep); break
+        c = text[start:end].strip()
+        if len(c) >= MIN_CHUNK_LEN: chunks.append(c)
+        start = end - overlap
+    return chunks
+
+def _chunk_doc(d): return d["path"], d["name"], chunk_text(d["text"])
+
+def build_chunks_parallel(docs):
+    if not docs: return {}
+    file_chunks = {}
+    try:
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, len(docs), 8)) as ex:
+            for fut in as_completed({ex.submit(_chunk_doc,d): d for d in docs}):
+                try:
+                    path, name, chunks = fut.result(timeout=60)
+                    file_chunks[path] = [{"text":c,"source":name,"path":path} for c in chunks]
+                except Exception: pass
+    except Exception:
+        for d in docs:
+            path, name, chunks = _chunk_doc(d)
+            file_chunks[path] = [{"text":c,"source":name,"path":path} for c in chunks]
+    return file_chunks
+
+
+# ── Embedding кэш ────────────────────────────────────────────
+def _chunk_hash(t): return hashlib.md5(safe_encode(t)).hexdigest()
+
+class EmbeddingCache:
+    def __init__(self):
+        self.dir = CACHE_DIR / "embeddings"; self.dir.mkdir(parents=True, exist_ok=True)
+        self._store, self._dirty, self._lock = None, False, threading.Lock()
+
+    def _ensure_loaded(self):
+        if self._store is not None:
+            return
+        self._store = {}
+        p = self.dir / "emb_v9.pkl"
+        if p.exists():
+            t0 = time.perf_counter()
+            try:
+                sz = p.stat().st_size
+                with open(p,"rb") as f: self._store = pickle.load(f)
+                el = time.perf_counter() - t0
+                print(f"  💎 Embedding кэш: {len(self._store):,} бичлэг | {sz//1024//1024}MB | {el:.1f}с")
+                if el > 10:
+                    print(f"  ⚠️  Кэш удаан ачаалагдлаа! python App.py --clear-cache")
+            except Exception:
+                self._store = {}
+
+    def save(self):
+        def _w():
+            with self._lock:
+                if not self._dirty or self._store is None: return
+                try:
+                    p = self.dir / "emb_v9.pkl"; tmp = p.with_suffix(".tmp")
+                    with open(tmp,"wb") as f: pickle.dump(self._store,f)
+                    tmp.replace(p); self._dirty = False
+                except Exception: pass
+        threading.Thread(target=_w, daemon=True).start()
+
+    def encode_with_cache(self, texts, encode_fn, progress_fn=None):
+        self._ensure_loaded()
+        hashes  = [_chunk_hash(t) for t in texts]
+        results = [None]*len(texts)
+        need_idx, need_txt, seen = [], [], {}
+        for i, h in enumerate(hashes):
+            c = self._store.get(h)
+            if c is not None:   results[i] = c
+            elif h in seen:     results[i] = ("dup", seen[h])
+            else:               seen[h] = len(need_idx); need_idx.append(i); need_txt.append(texts[i])
+        cached = sum(1 for r in results if r is not None and not isinstance(r,tuple))
+        print(f"  кэш:{cached} dedup:{sum(1 for r in results if isinstance(r,tuple))} шинэ:{len(need_txt)}")
+        if need_txt:
+            new = encode_fn(need_txt, progress_cb=lambda d,t,s: progress_fn(d,t,s) if progress_fn else None)
+            with self._lock:
+                for j, idx in enumerate(need_idx):
+                    results[idx] = new[j]; self._store[hashes[idx]] = new[j]
+                self._dirty = True
+            self.save()
+        for i, r in enumerate(results):
+            if isinstance(r,tuple) and r[0]=="dup": results[i] = results[need_idx[r[1]]]
+        return np.stack(results).astype("float32")
+
+
+# ══════════════════════════════════════════════════════════════
+# FIX #4: FileTracker with cache invalidation
+# ══════════════════════════════════════════════════════════════
+
+class FileTracker:
+    def __init__(self, fid):
+        self._p = CACHE_DIR/"trackers"/f"{fid}.pkl"; self._p.parent.mkdir(parents=True, exist_ok=True)
+        self._h = {}
+        if self._p.exists():
+            try:
+                with open(self._p,"rb") as f: self._h = pickle.load(f)
+            except Exception: pass
+
+    def save(self):
+        with open(self._p,"wb") as f: pickle.dump(self._h,f)
+
+    def invalidate(self, path: str):
+        """Force re-indexing of a specific file path."""
+        self._h.pop(path, None)
+        self.save()
+
+    def invalidate_all(self):
+        """Clear entire tracker cache — forces full re-index."""
+        self._h.clear()
+        self.save()
+
+    def filter_changed(self, docs, existing_chunks=None):
+        changed, skipped = [], 0
+        for d in docs:
+            cached_hash = self._h.get(d["path"])
+            has_chunks = (existing_chunks and d["path"] in existing_chunks
+                         and len(existing_chunks[d["path"]]) > 0) if existing_chunks else None
+
+            if cached_hash == d["hash"] and has_chunks is not False:
+                skipped += 1
+            else:
+                changed.append(d)
+                self._h[d["path"]] = d["hash"]
+                if cached_hash == d["hash"] and has_chunks is False:
+                    print(f"  🔄 Re-indexing (no chunks): {d['name']}")
+        self.save()
+        return changed, skipped
+
+
+# ── Embed engine ─────────────────────────────────────────────
+class EmbedEngine:
+    def __init__(self, key=DEFAULT_EMBED):
+        self.key  = key
+        self.info = EMBED_MODELS.get(key, EMBED_MODELS[DEFAULT_EMBED])
+        self._model = self._tok = self.backend = None
+        self._use_prefix = self.info.get("use_prefix", False)
+
+    def _load(self):
+        if self._model: return
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"]       = "1"
+        onnx_dir = _embed_onnx_path(self.key)
+        st_dir   = _embed_st_path(self.key)
+
+        if _DEVICE_TYPE == "cpu" and onnx_dir.exists():
+            try:
+                from optimum.onnxruntime import ORTModelForFeatureExtraction
+                from transformers import AutoTokenizer
+                import onnxruntime as ort
+                opts = ort.SessionOptions()
+                opts.intra_op_num_threads     = _opt_threads()
+                opts.inter_op_num_threads     = 1
+                opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL
+                q8    = onnx_dir/"model_q8.onnx"
+                fname = "model_q8.onnx" if q8.exists() else "model.onnx"
+
+                if "OpenVINOExecutionProvider" in ort.get_available_providers():
+                    try:
+                        self._model = ORTModelForFeatureExtraction.from_pretrained(
+                            str(onnx_dir), file_name=fname, session_options=opts,
+                            provider="OpenVINOExecutionProvider",
+                            provider_options={"device_type":"CPU","num_of_threads":_opt_threads()})
+                        self.backend = ("onnx_q8" if q8.exists() else "onnx") + "+openvino"
+                        self._tok = AutoTokenizer.from_pretrained(str(onnx_dir))
+                        print(f"  Embed: {self.backend} ({self.key}) ⚡ OpenVINO")
+                        return
+                    except Exception as e: print(f"  OpenVINO алдаа: {e}")
+
+                self._model = ORTModelForFeatureExtraction.from_pretrained(
+                    str(onnx_dir), file_name=fname, session_options=opts)
+                self.backend = "onnx_q8" if q8.exists() else "onnx"
+                self._tok = AutoTokenizer.from_pretrained(str(onnx_dir))
+                print(f"  Embed: {self.backend} ({self.key})")
+                return
+            except Exception as e: print(f"  ONNX алдаа: {e} → PyTorch")
+
+        if st_dir.exists(): self._load_st(self.key); return
+
+        for k in list(EMBED_MODELS):
+            if _embed_st_path(k).exists():
+                self.key = k; self.info = EMBED_MODELS[k]
+                self._use_prefix = self.info.get("use_prefix", False)
+                self._load_st(k); return
+        raise RuntimeError("Model олдсонгүй!\npython App.py --download")
+
+    def _load_st(self, key):
+        from sentence_transformers import SentenceTransformer
+        device = str(_DEVICE) if _DEVICE_TYPE != "cpu" else "cpu"
+        st_dir = _embed_st_path(key)
+        try:
+            self._model  = SentenceTransformer(str(st_dir), device=device)
+            self.backend = f"pytorch+{_DEVICE_TYPE}"
+            self._model.encode(["test"], convert_to_numpy=True, normalize_embeddings=True)
+            ml = " 🌐" if self.info.get("multilingual") else ""
+            print(f"  Embed: {self.backend} ({key}){ml}")
+        except Exception as e:
+            if _DEVICE_TYPE != "cpu":
+                print(f"  GPU алдаа: {e} → CPU")
+                self._model  = SentenceTransformer(str(st_dir), device="cpu")
+                self.backend = "pytorch+cpu"
+
+    def encode(self, texts, progress_cb=None, is_query=False):
+        self._load()
+        if self._use_prefix:
+            prefix = "query: " if is_query else "passage: "
+            texts  = [prefix+t for t in texts]
+        bs    = _gpu_batch(_opt_batch()) if _DEVICE_TYPE != "cpu" else _opt_batch()
+        total = len(texts)
+        start = time.perf_counter()
+
+        if self.backend.startswith("pytorch"):
+            all_embs = []
+            for i in range(0, total, bs):
+                batch = texts[i:i+bs]
+                try:
+                    emb = self._model.encode(batch, show_progress_bar=False, batch_size=len(batch),
+                                             convert_to_numpy=True, normalize_embeddings=True)
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        half = max(len(batch)//2, 1)
+                        emb  = np.vstack([self._model.encode(batch[j:j+half], show_progress_bar=False,
+                                         batch_size=half, convert_to_numpy=True, normalize_embeddings=True)
+                                         for j in range(0, len(batch), half)])
+                    else: raise
+                all_embs.append(emb)
+                if progress_cb: progress_cb(min(i+bs,total), total, start)
+            return np.vstack(all_embs).astype("float32")
+
+        all_embs = []
+        for i in range(0, total, bs):
+            enc = self._tok(texts[i:i+bs], padding=True, truncation=True,
+                            max_length=EMBED_MAX_LEN, return_tensors="np")
+            out = self._model(**dict(enc))
+            m3  = np.expand_dims(enc["attention_mask"], -1).astype("float32")
+            emb = (out.last_hidden_state*m3).sum(1) / np.maximum(m3.sum(1), 1e-9)
+            n   = np.linalg.norm(emb, axis=1, keepdims=True)
+            all_embs.append((emb/np.maximum(n,1e-9)).astype("float32"))
+            if progress_cb: progress_cb(min(i+bs,total), total, start)
+        return np.concatenate(all_embs, axis=0)
+
+
+# ── BM25 ────────────────────────────────────────────────────
+class BM25Index:
+    def __init__(self): self._index = self._tfidf_data = None; self._corpus = []; self._use_bm25 = False
+
+    @staticmethod
+    def _tokenize(t):
+        txt = (t or "").lower()
+        word_parts = re.findall(r'\w+', txt, re.UNICODE)
+        cjk_chars  = re.findall(r'[\u3040-\u309f\u30a0-\u30ff\u4e00-\u9fff\uac00-\ud7af]', txt)
+        return word_parts + cjk_chars
+
+    def build(self, texts):
+        self._corpus = [self._tokenize(t) for t in texts]
+        if not self._corpus: return
+        try:
+            from rank_bm25 import BM25Okapi
+            self._index = BM25Okapi(self._corpus); self._use_bm25 = True
+        except ImportError:
+            import math
+            n = len(self._corpus); df = {}
+            for toks in self._corpus:
+                for t in set(toks): df[t] = df.get(t,0)+1
+            self._tfidf_data = (n, df)
+
+    def search(self, query, top_k=20):
+        tokens = self._tokenize(query)
+        if not tokens or not self._corpus: return []
+        if self._use_bm25:
+            scores = self._index.get_scores(tokens)
+        else:
+            import math
+            n, df = self._tfidf_data
+            scores = np.zeros(len(self._corpus))
+            for t in tokens:
+                d = df.get(t,0)
+                if not d: continue
+                idf = math.log((n-d+0.5)/(d+0.5)+1)
+                for i, doc in enumerate(self._corpus):
+                    tf = doc.count(t)
+                    if tf: scores[i] += tf*idf
+        idx = np.argsort(scores)[::-1][:top_k]
+        return [(int(i), float(scores[i])) for i in idx if scores[i]>0]
+
+
+# ── Reranker (lazy load) ────────────────────────────────────
+class Reranker:
+    def __init__(self): self._model = None; self._tried = self._on_gpu = False; self.available = False
+
+    def _load(self):
+        if self._tried: return
+        self._tried = True
+        rp = _reranker_path()
+        if not rp.exists(): print("  Reranker байхгүй (--download)"); return
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        try:
+            from sentence_transformers import CrossEncoder
+            device = str(_DEVICE) if _DEVICE_TYPE != "cpu" else "cpu"
+            self._model    = CrossEncoder(str(rp), device=device)
+            self.available = True
+            self._on_gpu   = _DEVICE_TYPE != "cpu"
+            print(f"  Reranker: {'GPU' if self._on_gpu else 'CPU'}")
+        except Exception as e: print(f"  Reranker алдаа: {e}")
+
+    def rerank(self, query, chunks, top_k=3):
+        self._load()
+        if not self.available or not chunks: return chunks[:top_k]
+        bs = _gpu_batch(32) if self._on_gpu else 32
+        try: scores = self._model.predict([(query,c["text"]) for c in chunks], batch_size=bs, show_progress_bar=False)
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                scores = self._model.predict([(query,c["text"]) for c in chunks], batch_size=8, show_progress_bar=False)
+            else: raise
+        for i, c in enumerate(chunks): c["rerank_score"] = float(scores[i])
+        return sorted(chunks, key=lambda x: x["rerank_score"], reverse=True)[:top_k]
+
+
+# ── Hybrid store ─────────────────────────────────────────────
+class HybridStore:
+    def __init__(self, key=DEFAULT_EMBED):
+        self.engine    = EmbedEngine(key)
+        self.bm25      = BM25Index()
+        self.reranker  = Reranker()
+        self.cache     = EmbeddingCache()
+        self.faiss_idx = None
+        self.chunks    = []
+        self._folder   = ""
+
+    @staticmethod
+    def _cs_path(fid): return CACHE_DIR/"chunk_stores"/f"{fid}.pkl"
+
+    def _load_cs(self, fid):
+        p = self._cs_path(fid)
+        if p.exists():
+            try:
+                with open(p,"rb") as f: return pickle.load(f)
+            except Exception: pass
+        return {}
+
+    def _save_cs(self, fid, store):
+        p = self._cs_path(fid); p.parent.mkdir(parents=True, exist_ok=True)
+        def _w():
+            try:
+                tmp = p.with_suffix(".tmp")
+                with open(tmp,"wb") as f: pickle.dump(store,f)
+                tmp.replace(p)
+            except Exception: pass
+        threading.Thread(target=_w, daemon=True).start()
+
+    def build(self, docs, progress=None, folder_id=""):
+        import faiss
+        self._folder = str(Path(docs[0]["path"]).parent) if docs else ""
+
+        t_stage = time.perf_counter()
+        file_chunks = self._load_cs(folder_id) if folder_id else {}
+        print(f"  ⏱️ Chunk store ачаалах: {time.perf_counter()-t_stage:.1f}с")
+
+        t_stage = time.perf_counter()
+        tracker = FileTracker(folder_id) if folder_id else None
+        changed_docs = docs
+        if tracker:
+            changed_docs, skip_n = tracker.filter_changed(docs, existing_chunks=file_chunks)
+            if skip_n: print(f"  өөрчлөгдөөгүй: {skip_n}")
+            for d in docs:
+                if d["path"] not in file_chunks or len(file_chunks.get(d["path"], [])) == 0:
+                    if tracker._h.get(d["path"]) == d["hash"]:
+                        tracker._h.pop(d["path"], None)
+                        if d not in changed_docs:
+                            changed_docs.append(d)
+                            print(f"  🔄 Stale: {d['name']}")
+            tracker.save()
+        print(f"  ⏱️ Tracker: {time.perf_counter()-t_stage:.1f}с")
+
+        existing    = {d["path"] for d in docs}
+        if changed_docs:
+            if progress: progress(0.30, desc=f"Chunk: {len(changed_docs)} файл")
+            file_chunks.update(build_chunks_parallel(changed_docs))
+        for path in list(file_chunks):
+            if path not in existing: del file_chunks[path]
+        if folder_id: self._save_cs(folder_id, file_chunks)
+
+        self.chunks, all_texts = [], []
+        for d in docs:
+            for ch in file_chunks.get(d["path"],[]):
+                self.chunks.append(ch); all_texts.append(ch["text"])
+        if not all_texts: return 0
+
+        src_counts = {}
+        for ch in self.chunks:
+            src = ch.get("source", "?")
+            src_counts[src] = src_counts.get(src, 0) + 1
+        n_files = len(src_counts)
+        n_chunks = len(all_texts)
+        print(f"  📊 {n_files} файл → {n_chunks:,} chunk")
+        for src, cnt in sorted(src_counts.items(), key=lambda x: -x[1])[:5]:
+            print(f"     • {src}: {cnt} chunk")
+        if n_files > 5:
+            print(f"     ... +{n_files-5} файл")
+
+        if n_chunks > 10000:
+            est_min = n_chunks / 150
+            print(f"\n  ⚠️  {n_chunks:,} chunk маш их байна!")
+            print(f"  ⏱️  Тооцоолсон хугацаа: ~{est_min:.0f} секунд ({est_min/60:.0f} минут)")
+
+        if progress: progress(0.33, desc="BM25 индекс")
+        self.bm25.build(all_texts)
+
+        tag = f"[{_gpu_str()}]"
+        if progress: progress(0.38, desc=f"Embedding {tag}: {len(all_texts)} chunk")
+        t0 = time.perf_counter()
+
+        def _pf(done, total, s):
+            if progress:
+                el = max(time.perf_counter()-s, 1e-6)
+                progress(0.38+0.42*done/max(total,1), desc=f"Embedding {done}/{total} | {done/el:.0f}/с")
+
+        embeddings = self.cache.encode_with_cache(
+            all_texts,
+            lambda texts, progress_cb=None: self.engine.encode(texts, progress_cb=progress_cb, is_query=False),
+            _pf)
+        el = time.perf_counter()-t0
+        print(f"  Embedding: {el:.1f}с | {len(all_texts)/max(el,0.001):.0f} chunk/с {tag}")
+
+        if progress: progress(0.85, desc="FAISS индекс")
+        dim, n = embeddings.shape[1], len(all_texts)
+        if n > 5000:
+            nl  = min(int(np.sqrt(n)), 256)
+            idx = faiss.IndexIVFFlat(faiss.IndexFlatIP(dim), dim, nl, faiss.METRIC_INNER_PRODUCT)
+            idx.train(embeddings); idx.add(embeddings)
+            idx.nprobe = max(min(nl//6,24), 6)
+        else:
+            idx = faiss.IndexFlatIP(dim); idx.add(embeddings)
+        self.faiss_idx = idx
+        if progress: progress(1.0, desc="✅ Бэлэн!")
+        return n
+
+    def save(self, path):
+        import faiss
+        if not self.faiss_idx: raise RuntimeError("Хадгалах индекс байхгүй")
+        faiss.write_index(self.faiss_idx, path+".faiss")
+        with open(path+".meta","wb") as f:
+            pickle.dump({"chunks":self.chunks,"key":self.engine.key,
+                         "texts":[c["text"] for c in self.chunks],
+                         "folder":self._folder,"saved_at":time.strftime("%Y-%m-%d %H:%M")}, f)
+        print(f"  💾 {path}")
+
+    def load(self, path):
+        try:
+            import faiss
+            self.faiss_idx = faiss.read_index(path+".faiss")
+            with open(path+".meta","rb") as f: meta = pickle.load(f)
+            self.chunks  = meta["chunks"]
+            self.engine  = EmbedEngine(meta.get("key", DEFAULT_EMBED))
+            self._folder = meta.get("folder","")
+            self.bm25.build(meta.get("texts",[c["text"] for c in self.chunks]))
+            ml = " 🌐" if self.engine.info.get("multilingual") else ""
+            print(f"  ✅ {len(self.chunks):,} chunk [{self.engine.key}{ml}]")
+
+            srcs = {}
+            for ch in self.chunks:
+                s = ch.get("source","?")
+                srcs[s] = srcs.get(s,0)+1
+            print(f"  📄 {len(srcs)} файл:")
+            for s, n in sorted(srcs.items(), key=lambda x: -x[1])[:10]:
+                print(f"     • {s}: {n} chunk")
+
+            return True
+        except Exception as e: print(f"  ❌ {e}"); return False
+
+    def _keyword_search(self, query, top_k):
+        q    = query.lower().strip()
+        STOP = {"вэ","бэ","юу","яу","гэж","гэх","мэт","байна","бол",
+                "нь","ын","ийн","ийг","ний","дэх","дээр","дотор","аа","ээ"}
+        words = [w for w in re.findall(r'\w+', q, re.UNICODE) if w not in STOP]
+        if not words: return []
+        max_s = 3.0 + sum(2.0 if len(w)>=4 else 1.0 for w in words)
+        scored = []
+        for i, ch in enumerate(self.chunks):
+            tl = ch["text"].lower()
+            s  = (3.0 if q in tl else 0.0) + sum(2.0 if len(w)>=4 else 1.0 for w in words if w in tl)
+            if s > 0: scored.append((i, s/max_s))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return [{**self.chunks[i],"score":s,"vector_score":0.0,"bm25_score":0.0,"_kw":True}
+                for i,s in scored[:top_k]]
+
+    def search(self, query, top_k=DEFAULT_TOP_K, use_reranker=True, debug=False):
+        if not self.faiss_idx or not self.chunks: return []
+        cand_k = min(max(top_k*12,60), len(self.chunks))
+
+        expansions = expand_query(query)
+        if debug and len(expansions) > 1:
+            print(f"  🔄 Query expansion: {expansions[:4]}")
+
+        qe = self.engine.encode([query], is_query=True)
+
+        vs, vi = self.faiss_idx.search(qe, cand_k)
+        vmx    = max(float(vs[0][0]), 1e-9)
+        vh     = {int(i): float(s)/vmx for s,i in zip(vs[0],vi[0]) if i>=0}
+
+        bm25_queries = _build_bm25_queries(query, expansions)
+
+        bh: dict = {}
+        for bq in bm25_queries:
+            for idx, sc in self.bm25.search(bq, top_k=cand_k):
+                bh[idx] = max(bh.get(idx, 0.0), sc)
+        bmx = max(bh.values(), default=1e-9)
+        bh  = {i: s/bmx for i,s in bh.items()}
+
+        vb = []
+        for idx in set(vh)|set(bh):
+            v, b = vh.get(idx,0.0), bh.get(idx,0.0)
+            vb.append({**self.chunks[idx],"score":VECTOR_WEIGHT*v+BM25_WEIGHT*b,
+                       "vector_score":v,"bm25_score":b})
+        vb.sort(key=lambda x: x["score"], reverse=True)
+
+        kw_results = self._keyword_search(query, top_k*4)
+        kw_map     = {_chunk_key(c, 120): c for c in kw_results}
+        seen, merged = {}, []
+        for c in vb[:cand_k]:
+            k80 = _chunk_key(c, 120)
+            if kw_c := kw_map.pop(k80, None):
+                c = dict(c); c["score"] = min(c["score"]+kw_c["score"]*0.7, 1.0); c["_kw"] = True
+            seen[k80] = True; merged.append(c)
+        for k, c in kw_map.items():
+            if k not in seen:
+                c = dict(c); c["score"] = min(c["score"]+KEYWORD_BOOST, 1.0)
+                merged.append(c)
+
+        for c in merged:
+            rel = _file_relevance_score(c, query, expansions)
+            if rel > 0:
+                boost = rel * 1.0
+                c["score"] = min(c["score"] + boost, 1.0)
+                c["_rel"]  = rel
+        merged.sort(key=lambda x: x["score"], reverse=True)
+
+        seen_for_inject = {_chunk_key(c) for c in merged}
+        injected = _ensure_filename_candidates(self, query, expansions, seen_for_inject)
+        if injected:
+            merged = merged + injected
+            merged.sort(key=lambda x: x["score"], reverse=True)
+            if debug:
+                n_inj = len(injected)
+                srcs  = list({c["source"] for c in injected[:3]})
+                print(f"  📌 Filename inject: +{n_inj} chunks from {srcs}")
+
+        if debug:
+            print(f"\n  🔍 [{query[:40]}]")
+            for c in merged[:5]:
+                tag = "🔑" if c.get("_kw") else "📐"
+                print(f"  {tag} {c['source']} s={c['score']:.3f} v={c['vector_score']:.2f} b={c['bm25_score']:.2f}")
+
+        candidates = merged[:cand_k]
+        if use_reranker and self.reranker.available and len(candidates)>1:
+            if sum(1 for ch in query if ord(ch)<128)/max(len(query),1) > 0.7:
+                return self.reranker.rerank(query, candidates, top_k)
+        return candidates[:top_k]
+
+    def search_top_files(self, query, n_files=5):
+        if not self.faiss_idx or not self.chunks: return []
+        expansions = expand_query(query)
+
+        cand_k = min(max(n_files*20, 100), len(self.chunks))
+        qe     = self.engine.encode([query], is_query=True)
+        vs, vi = self.faiss_idx.search(qe, cand_k)
+        vmx    = max(float(vs[0][0]), 1e-9)
+        vh     = {int(i): float(s)/vmx for s,i in zip(vs[0],vi[0]) if i>=0}
+        br     = self.bm25.search(query, top_k=cand_k)
+        bmx    = max((s for _,s in br), default=1e-9)
+        bh     = {i: s/bmx for i,s in br}
+        file_best = {}
+        for idx in set(vh)|set(bh):
+            score = VECTOR_WEIGHT*vh.get(idx,0)+BM25_WEIGHT*bh.get(idx,0)
+            src   = self.chunks[idx]["source"]
+            if src not in file_best or score > file_best[src]:
+                file_best[src] = score
+        for c in self._keyword_search(query, cand_k):
+            src = c["source"]
+            file_best[src] = min(file_best.get(src,0)+c["score"]*0.6, 1.0)
+
+        STOP = _FNAME_STOP
+        q_words = [w for w in re.findall(r"\w+", query.lower(), re.UNICODE)
+                   if len(w) >= 2 and w not in STOP]
+        exp_words = set(q_words)
+        for exp in expansions[1:5]:
+            for w in re.findall(r"\w+", exp.lower(), re.UNICODE):
+                if len(w) >= 2 and w not in STOP:
+                    exp_words.add(w)
+
+        if q_words:
+            seen_srcs: dict[str, float] = {}
+            for ch in self.chunks:
+                src = ch.get("source", "")
+                src_l = src.lower()
+                if src in seen_srcs:
+                    continue
+                hits = sum(1 for w in q_words if w in src_l)
+                if hits == 0:
+                    continue
+                file_ratio  = hits / len(q_words)
+                seen_srcs[src] = file_ratio
+                if file_ratio >= 1.0:
+                    floor = 0.40
+                elif file_ratio >= 0.5:
+                    floor = 0.55
+                else:
+                    floor = 0.40
+                file_best[src] = max(file_best.get(src, 0.0), floor)
+
+        return [f for f,_ in sorted(file_best.items(),
+                                     key=lambda x: x[1], reverse=True)[:n_files]]
+
+
+# ── Query expansion ──────────────────────────────────────────
+_ABBR: dict[str, str] = {
+    "cv":    "curriculum vitae resume",
+    "gpa":   "grade point average score",
+    "phd":   "doctor of philosophy doctorate",
+    "mba":   "master of business administration",
+    "hr":    "human resources personnel",
+    "kpi":   "key performance indicator metric",
+    "roi":   "return on investment profit",
+    "qa":    "quality assurance testing",
+    "r&d":   "research and development",
+    "ai":    "artificial intelligence",
+    "ml":    "machine learning",
+    "llm":   "large language model",
+    "nlp":   "natural language processing",
+    "api":   "application programming interface",
+    "db":    "database",
+    "ui":    "user interface",
+    "ux":    "user experience",
+    "os":    "operating system",
+    "gpu":   "graphics processing unit",
+    "cpu":   "central processing unit",
+    "ram":   "random access memory",
+    "ceo":   "chief executive officer",
+    "cto":   "chief technology officer",
+    "b2b":   "business to business",
+    "b2c":   "business to consumer",
+    "ipo":   "initial public offering",
+    "jlpt":  "japanese language proficiency test N1 N2 N3 N4 N5 япон хэл",
+    "toefl": "test of english foreign language TOEFL score",
+    "ielts": "international english language testing system IELTS band",
+    "topik": "test of proficiency korean language TOPIK солонгос хэл",
+    "hsk":   "hanyu shuiping kaoshi chinese proficiency HSK хятад хэл",
+    "ббсб":  "банк бус санхүүгийн байгууллага",
+    "ааноат": "аж ахуйн нэгж байгууллагын орлогын албан татвар",
+    "тэш":   "тусгай эрхийн шаардлага",
+    # Санхүүгийн ерөнхий нэр томьёо
+    "vat":   "value added tax нэмэгдсэн өртгийн татвар",
+    "gdp":   "gross domestic product дотоодын нийт бүтээгдэхүүн",
+    "cpi":   "consumer price index хэрэглээний үнийн индекс",
+}
+
+_DOMAIN_EXPAND: dict[str, list[str]] = {
+    "jlpt": ["N1", "N2", "N3", "N4", "N5", "japanese language", "япон хэл", "日本語能力試験"],
+    "японы": ["jlpt", "N1", "N2", "N3", "N4", "N5", "japanese", "nihongo"],
+    "япон хэл": ["jlpt", "N1", "N2", "N3", "N4", "N5", "japanese language proficiency"],
+    "toefl": ["english", "англи хэл", "score", "iBT", "PBT"],
+    "ielts": ["english", "англи хэл", "band", "academic", "general"],
+    "topik": ["korean", "солонгос хэл", "level", "한국어"],
+    "hsk":   ["chinese", "хятад хэл", "level", "汉语"],
+    "банк":  ["хүү", "зээл", "данс", "гүйлгээ", "шилжүүлэг"],
+    "зээл":  ["хүү", "банк", "loan", "interest", "төлбөр"],
+}
+
+# Хувийн асуултыг таних ерөнхий тэмдэгүүд
+_PERSONAL_SIGNALS: set[str] = {
+    "my", "mine", "i ", "i'm", "i've", "my own",
+    "миний", "минь", "надад", "надаас", "би ",
+    "our", "we ", "манай",
+}
+
+# Хувийн баримт бичгийн ерөнхий түлхүүр үгс (тусгай нэр байхгүй)
+_PERSONAL_DOC_KEYWORDS: set[str] = {
+    "resume", "curriculum vitae", "cv", "entry sheet", "entry form",
+    "portfolio", "profile", "cover letter", "application",
+    "intern", "internship", "self introduction", "personal statement",
+    "gpa", "transcript", "certificate", "qualification",
+    "エントリーシート", "履歴書", "職務経歴書", "インターン",
+    "自己紹介", "志望動機", "学歴", "資格", "語学",
+    "намтар", "анкет", "дадлага", "сурлагын", "үнэмлэх",
+}
+
+
+def _is_personal_query(query: str) -> bool:
+    q = query.lower()
+    return any(sig in q for sig in _PERSONAL_SIGNALS)
+
+
+def _is_personal_doc(chunk: dict) -> bool:
+    """Баримт бичиг нь хувийн документ мөн эсэхийг ерөнхий түлхүүр үгсээр шалгана."""
+    src     = chunk.get("source", "").lower()
+    preview = chunk.get("text", "")[:400].lower()
+    # Зөвхөн ерөнхий хувийн баримтын нэр томьёогоор шалгана — хувийн нэр ашиглахгүй
+    return any(kw in src or kw in preview for kw in _PERSONAL_DOC_KEYWORDS)
+
+
+_expand_cache: dict[str, list] = {}
+_expand_cache_max = 64
+
+def expand_query(query: str) -> list[str]:
+    q_lower = query.lower().strip()
+    if q_lower in _expand_cache:
+        return _expand_cache[q_lower]
+    result = _expand_query_impl(q_lower)
+    if len(_expand_cache) >= _expand_cache_max:
+        _expand_cache.clear()
+    _expand_cache[q_lower] = result
+    return result
+
+def _expand_query_impl(q_lower: str) -> list[str]:
+    tokens   = re.findall(r"\w+", q_lower, re.UNICODE)
+    expanded = [q_lower]
+
+    for tok in tokens:
+        full = _ABBR.get(tok)
+        if full and full not in expanded:
+            expanded.append(full)
+        full2 = _ABBR.get(tok.lower())
+        if full2 and full2 not in expanded:
+            expanded.append(full2)
+
+    for tok in tokens:
+        domain_terms = _DOMAIN_EXPAND.get(tok.lower())
+        if domain_terms:
+            for term in domain_terms:
+                tl = term.lower()
+                if len(term.replace(" ", "")) <= 2:
+                    prefixed = f"{tok.upper()} {term}"
+                    if prefixed.lower() not in [e.lower() for e in expanded]:
+                        expanded.append(prefixed)
+                else:
+                    if tl not in [e.lower() for e in expanded]:
+                        expanded.append(term)
+
+    for i, t1 in enumerate(tokens[:-1]):
+        combo_key = f"{t1} {tokens[i+1]}"
+        domain_terms = _DOMAIN_EXPAND.get(combo_key)
+        if domain_terms:
+            for term in domain_terms:
+                tl = term.lower()
+                if len(term.replace(" ", "")) <= 2:
+                    prefixed = f"{combo_key.upper()} {term}"
+                    if prefixed.lower() not in [e.lower() for e in expanded]:
+                        expanded.append(prefixed)
+                elif tl not in [e.lower() for e in expanded]:
+                    expanded.append(term)
+        combo = _ABBR.get(combo_key)
+        if combo and combo not in expanded:
+            expanded.append(combo)
+
+    if _is_personal_query(q_lower):
+        # Хувийн асуулт гарвал ерөнхий баримт бичгийн нэр томьёо нэмнэ
+        _personal_extras = [
+            "resume", "cv", "profile", "certificate", "qualification",
+            "gpa", "grade", "level", "score", "намтар", "анкет",
+            "report", "document", "тайлан", "баримт",
+        ]
+        for pe in _personal_extras:
+            if pe.lower() not in [e.lower() for e in expanded]:
+                expanded.append(pe)
+
+    return expanded
+
+
+def _build_bm25_queries(question: str, expansions: list, extra_terms: list = None) -> set:
+    stop = {
+        "вэ", "бэ", "юу", "яу", "гэж", "гэх", "нь", "ын", "ийн", "бол", "байна",
+        "дэх", "дотор", "the", "is", "a", "of", "and", "in", "to", "for", "with",
+        "on", "at", "by", "an",
+    }
+    level_re = re.compile(r"^[nN]\d$")
+    queries = {question}
+    extra_terms = extra_terms or []
+
+    def _add_strong_tokens(text: str):
+        for tok in re.findall(r"\w+", text, re.UNICODE):
+            tl = tok.lower()
+            if len(tl) < 3 or tl in stop or level_re.match(tl):
+                continue
+            if any(ch.isdigit() for ch in tl) or len(tl) >= 5:
+                queries.add(tok)
+
+    _add_strong_tokens(question)
+
+    for exp_q in expansions[:6]:
+        toks = re.findall(r"\w+", exp_q, re.UNICODE)
+        if not toks:
+            continue
+        if len(toks) <= 3:
+            queries.add(exp_q)
+        else:
+            i = 0
+            while i < len(toks):
+                t1 = toks[i]
+                t2 = toks[i + 1] if i + 1 < len(toks) else None
+                if level_re.match(t1):
+                    i += 1
+                elif t2 and level_re.match(t2):
+                    queries.add(f"{t1} {t2}")
+                    i += 2
+                else:
+                    queries.add(f"{t1} {t2}" if t2 else t1)
+                    i += 2
+        _add_strong_tokens(exp_q)
+
+    for term in extra_terms[:8]:
+        term = str(term).strip()
+        if len(term) >= 3:
+            queries.add(term)
+            _add_strong_tokens(term)
+
+    return {q for q in queries if q and str(q).strip()}
+
+
+def _build_keyword_fallback_terms(query: str, expansions: list, extra_terms: list = None) -> list:
+    stop = {
+        "вэ", "бэ", "юу", "яу", "гэж", "гэх", "нь", "ын", "ийн", "бол", "байна",
+        "дэх", "дотор", "the", "is", "a", "of", "and", "in", "to", "for", "with",
+        "on", "at", "by", "an",
+    }
+    extra_terms = extra_terms or []
+    pool = [query] + list(expansions[:4]) + [str(x) for x in extra_terms[:8]]
+    out = []
+    seen = set()
+
+    def _push(term: str):
+        tl = str(term).lower().strip()
+        if not tl or tl in seen:
+            return
+        if tl in stop:
+            return
+        if len(tl) >= 3 or any(ch.isdigit() for ch in tl):
+            seen.add(tl)
+            out.append(tl)
+
+    for src in pool:
+        _push(src)
+        for tok in re.findall(r"\w+", src.lower(), re.UNICODE):
+            _push(tok)
+        for raw in src.lower().split():
+            compact = re.sub(r"[\W_]+", "", raw, flags=re.UNICODE)
+            _push(compact)
+
+    out.sort(key=len, reverse=True)
+    return out[:10]
+
+
+def _chunk_key(chunk: dict, prefix_len: int = 100) -> str:
+    return f"{chunk.get('source', '?')}|{chunk.get('text', '')[:prefix_len]}"
+
+
+def _is_filename_like_query(query: str) -> bool:
+    q = (query or "").strip()
+    if not q:
+        return False
+    if re.search(r"[\\/]", q):
+        return True
+    if re.search(r"\.[a-zA-Z0-9]{1,6}\b", q):
+        return True
+    tokens = re.findall(r"[\w$.-]+", q, re.UNICODE)
+    if "$" in q and tokens:
+        return True
+    if len(tokens) <= 3:
+        for t in tokens:
+            if any(ch.isalpha() for ch in t) and any(ch.isdigit() for ch in t) and len(t) >= 4:
+                return True
+    return False
+
+
+def search_by_keyword(store, query: str, top_files: int = 8, chunks_per_file: int = 2) -> list:
+    if not store or not getattr(store, "chunks", None):
+        return []
+
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+
+    terms = [q]
+    for tok in re.findall(r"[\w$.-]+", q, re.UNICODE):
+        t = tok.strip(" ._-")
+        if len(t) >= 2 and t not in _FNAME_STOP:
+            terms.append(t)
+        compact = re.sub(r"[^\w]+", "", t, flags=re.UNICODE)
+        if len(compact) >= 3 and compact not in _FNAME_STOP:
+            terms.append(compact)
+
+    seen_term, clean_terms = set(), []
+    for t in terms:
+        if t and t not in seen_term:
+            seen_term.add(t)
+            clean_terms.append(t)
+    clean_terms = clean_terms[:12]
+
+    by_source = {}
+    for ch in store.chunks:
+        src = ch.get("source", "")
+        by_source.setdefault(src, []).append(ch)
+
+    file_rank = []
+    for src, chunks in by_source.items():
+        src_l = _normalize_filename(src).lower()
+        matched = [t for t in clean_terms if t in src_l]
+        if not matched:
+            continue
+
+        ratio = len(matched) / max(len(clean_terms), 1)
+        exact_bonus = 0.20 if q in src_l else 0.0
+        code_bonus = 0.20 if any(any(ch.isdigit() for ch in t) for t in matched) else 0.0
+        fscore = min(0.62 + ratio * 0.30 + exact_bonus + code_bonus, 0.98)
+        if any(any(ch.isdigit() for ch in t) and len(t) >= 4 for t in matched):
+            fscore = max(fscore, 0.90)
+        file_rank.append((src, fscore, chunks, matched))
+
+    file_rank.sort(key=lambda x: x[1], reverse=True)
+    results = []
+    for src, fscore, chunks, matched in file_rank[:max(top_files, 1)]:
+        scored_chunks = []
+        for ch in chunks:
+            txt_l = ch.get("text", "").lower()
+            t_hits = sum(1 for t in clean_terms if len(t) >= 3 and t in txt_l)
+            cscore = min(fscore + min(t_hits, 4) * 0.05, 0.99)
+            scored_chunks.append((cscore, t_hits, ch))
+        scored_chunks.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+        for cscore, _, ch in scored_chunks[:max(chunks_per_file, 1)]:
+            results.append({
+                **ch,
+                "score": cscore,
+                "vector_score": 0.0,
+                "bm25_score": 0.0,
+                "keyword_score": cscore,
+                "_filename_kw": True,
+                "_fname_terms": matched[:3],
+            })
+
+    return results
+
+
+def semantic_search(store, query: str, top_k: int = 20) -> list:
+    if not store or not getattr(store, "faiss_idx", None) or not getattr(store, "chunks", None):
+        return []
+
+    cand_k = min(max(top_k * 10, 80), len(store.chunks))
+    qe = store.engine.encode([query], is_query=True)
+    vs, vi = store.faiss_idx.search(qe, cand_k)
+    vmx = max(float(vs[0][0]), 1e-9)
+
+    out = []
+    for sc, idx in zip(vs[0], vi[0]):
+        if idx < 0:
+            continue
+        v = float(sc) / vmx
+        ch = dict(store.chunks[int(idx)])
+        ch.update({
+            "score": v,
+            "vector_score": v,
+            "bm25_score": 0.0,
+            "keyword_score": 0.0,
+            "_semantic": True,
+            "_semantic_model": SEMANTIC_REFERENCE_MODEL,
+        })
+        out.append(ch)
+
+    return out[:max(top_k, 1)]
+
+
+def _ollama_keyword_match_search(store, query: str, expansions: list,
+                                 ollama_kws: list, limit: int = 80) -> list:
+    if not store or not getattr(store, "chunks", None) or not ollama_kws:
+        return []
+
+    stop = _FNAME_STOP
+    terms, seen = [], set()
+    for kw in ollama_kws[:12]:
+        kl = str(kw).lower().strip()
+        if len(kl) >= 3 and kl not in stop and kl not in seen:
+            seen.add(kl)
+            terms.append(kl)
+        compact = re.sub(r"[^\w]+", "", kl, flags=re.UNICODE)
+        if len(compact) >= 3 and compact not in stop and compact not in seen:
+            seen.add(compact)
+            terms.append(compact)
+
+    ranked = []
+    for ch in store.chunks:
+        txt_l = ch.get("text", "").lower()
+        if not txt_l:
+            continue
+        hits = [t for t in terms if t in txt_l]
+        if not hits:
+            continue
+
+        rel = _file_relevance_score(ch, query, expansions)
+        base = min(0.40 + (len(hits) - 1) * 0.10 + rel * 0.20, 0.98)
+        ranked.append({
+            **ch,
+            "score": base,
+            "vector_score": 0.0,
+            "bm25_score": 0.0,
+            "keyword_score": min(len(hits) / max(len(terms), 1) * 2.0, 1.0),
+            "_file_rel": rel,
+            "_ollama_kw_direct": hits[:4],
+        })
+
+    ranked.sort(key=lambda x: (x["score"], len(x.get("_ollama_kw_direct", []))), reverse=True)
+    return ranked[:max(limit, 1)]
+
+
+# ── Table-first retrieval ────────────────────────────────────
+_TABLE_MD_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_TABLE_SEPS      = re.compile(r"[\|	,;;　]")
+
+
+def _tbl_query_tokens(query: str) -> list:
+    STOP = {
+        "вэ","бэ","юу","яу","гэж","гэх","нь","ын","ийн","бол","байна",
+        "дэх","дотор","миний","минь","надад","би",
+        "the","is","a","of","and","in","to","for","with","on","at","by","an",
+        "my","what","how","when","where","who","which","i","me","am","are",
+    }
+    return [t for t in re.findall(r"\w+", query.lower(), re.UNICODE)
+            if len(t) >= 2 and t not in STOP]
+
+
+def _tbl_is_structured(line: str) -> bool:
+    ln = (line or "").strip()
+    if not ln:
+        return False
+    if _TABLE_MD_SEP_RE.match(ln):
+        return True
+    if _TABLE_SEPS.search(ln):
+        return True
+    if re.search(r"\w.{0,30}[:=]\s*\S", ln):
+        return True
+    return False
+
+
+def _tbl_split_cells(line: str) -> list:
+    ln = (line or "").strip()
+    if not ln:
+        return []
+    for sep in ("|", "	", ",", ";"):
+        parts = ln.strip(sep).split(sep)
+        if len(parts) >= 2:
+            return [p.strip() for p in parts if p.strip()]
+    m = re.match(r"^(.{1,40}?)\s*[:=]\s*(.+)$", ln)
+    if m:
+        return [m.group(1).strip(), m.group(2).strip()]
+    return []
+
+
+def _tbl_read_raw(path: str) -> str:
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return ""
+    if p.suffix.lower() in {".csv", ".tsv", ".txt", ".md", ".log", ".rst"}:
+        for enc in ["utf-8", "utf-16", "cp1251", "latin-1"]:
+            try:
+                return p.read_text(encoding=enc)
+            except Exception:
+                continue
+    reader = READERS.get(p.suffix.lower())
+    if not reader:
+        return ""
+    try:
+        return reader(str(p)) or ""
+    except Exception:
+        return ""
+
+
+def _tbl_score_file(source: str, path: str, raw: str,
+                    q_tokens: list, line_window: int = 8):
+    if not raw or not q_tokens or len(raw.strip()) < 20:
+        return None
+
+    lines = [ln.strip() for ln in raw[:200000].splitlines() if ln.strip()]
+    if not lines:
+        return None
+
+    kw_idx = [i for i, ln in enumerate(lines)
+               if any(tok in ln.lower() for tok in q_tokens)]
+    if not kw_idx:
+        return None
+
+    struct_set = {i for i, ln in enumerate(lines) if _tbl_is_structured(ln)}
+    best_snip  = None
+    best_kv    = None
+    best_val   = None
+    win_hits   = 0
+    kv_hits    = 0
+
+    for ki in kw_idx:
+        lo = max(0, ki - line_window)
+        hi = min(len(lines) - 1, ki + line_window)
+
+        has_struct = any(j in struct_set for j in range(lo, hi + 1))
+        if not has_struct:
+            if not re.search(r"\w.{0,30}[:=]\s*\S", lines[ki]):
+                continue
+
+        win_hits += 1
+        if best_snip is None:
+            best_snip = "\n".join(lines[lo:hi + 1])
+
+        for j in range(lo, hi + 1):
+            cells = _tbl_split_cells(lines[j])
+            if len(cells) < 2:
+                continue
+            for ci, cell in enumerate(cells):
+                if not any(tok in cell.lower() for tok in q_tokens):
+                    continue
+                for nx in cells[ci + 1:ci + 3]:
+                    if len(nx.strip()) >= 1:
+                        kv_hits += 1
+                        if best_kv is None:
+                            best_kv  = f"{cell}→{nx}"
+                            best_val = nx
+                        break
+
+    if win_hits == 0:
+        return None
+
+    score = 0.72 + min(win_hits * 0.15, 0.30) + min(kv_hits * 0.18, 0.36)
+
+    return {
+        "source":           source,
+        "path":             path,
+        "text":             (best_snip or "")[:1800],
+        "score":            min(score, 1.85),
+        "vector_score":     0.0,
+        "bm25_score":       0.0,
+        "keyword_score":    1.0,
+        "_table_candidate": True,
+        "_table_kv":        best_kv or f"{q_tokens[0]}|?",
+        "_table_value":     best_val or "",
+        "_table_wins":      win_hits,
+        "_table_kvhits":    kv_hits,
+    }
+
+
+def _table_first_retrieval(store, query: str, max_tables: int = 10,
+                            line_window: int = 8) -> list:
+    if not store or not getattr(store, "chunks", None):
+        return []
+
+    q_tokens = _tbl_query_tokens(query)
+    if not q_tokens:
+        return []
+
+    file_map: dict = {}
+    for ch in store.chunks:
+        p = ch.get("path")
+        if not p or p in file_map:
+            continue
+        file_map[p] = ch.get("source", Path(p).name)
+
+    candidates = []
+    for path, source in file_map.items():
+        raw  = _tbl_read_raw(path)
+        cand = _tbl_score_file(source, path, raw,
+                               q_tokens=q_tokens, line_window=line_window)
+        if cand:
+            candidates.append(cand)
+
+    candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    return candidates[:max(1, max_tables)]
+
+
+def _llm_table_rerank(model: str, query: str, candidates: list):
+    meta = {}
+    if not candidates or not model or model == "(олдсонгүй)" or not _ollama_ping():
+        return candidates, meta
+
+    top  = candidates[:8]
+    rows = []
+    for i, c in enumerate(top, 1):
+        sn = c.get("text", "").replace("\n", " ")[:280]
+        rows.append(f"[{i}] file={c.get('source','?')} "
+                    f"kv={c.get('_table_kv','?')} | {sn}")
+
+    prompt = (
+        f"Question: {query}\n\n"
+        "Pick the ONE snippet most clearly answering the question.\n"
+        "Return JSON only:\n"
+        '{"best_index":1,"confidence":0.9,"answer":"value","has_answer":true}\n\n'
+        "Snippets:\n" + "\n".join(rows)
+    )
+
+    out = _ollama_call_simple(model, prompt, timeout=15)
+    if not out:
+        return candidates, meta
+
+    try:
+        m = re.search(r"\{[\s\S]*?\}", out)
+        if not m:
+            return candidates, meta
+        data    = json.loads(m.group())
+        bi      = int(data.get("best_index", 0))
+        conf    = float(data.get("confidence", 0.0))
+        answer  = str(data.get("answer", "")).strip()
+        has_ans = bool(data.get("has_answer", False))
+    except Exception:
+        return candidates, meta
+
+    if bi < 1 or bi > len(top):
+        return candidates, meta
+
+    reranked = []
+    for i, c in enumerate(top, 1):
+        cc = dict(c)
+        if i == bi:
+            cc["score"]      = min(cc.get("score", 0.0) + max(conf, 0.2) * 0.35, 1.95)
+            cc["_table_llm"] = True
+            if answer:
+                cc["_table_answer"] = answer
+        else:
+            cc["score"] = cc.get("score", 0.0) * 0.75
+        reranked.append(cc)
+
+    reranked.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    meta["table_best"]   = reranked[0].get("source", "?")
+    meta["table_answer"] = reranked[0].get("_table_answer", "") if has_ans else ""
+    return reranked + candidates[8:], meta
+
+
+# ── AI-Enhanced Search Functions ─────────────────────────────
+
+def classify_query_type(query: str) -> str:
+    q = query.lower().strip()
+
+    if '"' in query or "'" in query:
+        return "exact"
+    if re.search(r'\b(яг|exact|literal|код|code)\b', q, re.UNICODE):
+        return "exact"
+
+    if re.search(r'\d{4}|\d+%|\$\d+|₮\d+', q):
+        return "factual"
+    if re.search(r'\b(хэд|хэзээ|хэн|аль|ямар|хаана|when|where|who|how many|which)\b', q, re.UNICODE):
+        return "factual"
+
+    if re.search(r'\b(яагаад|юу|тайлбарла|ялгаа|учир|why|what|explain|difference|meaning|concept)\b', q, re.UNICODE):
+        return "semantic"
+    if len(q.split()) > 8:
+        return "semantic"
+
+    return "mixed"
+
+
+def get_dynamic_weights(query: str) -> dict:
+    qtype = classify_query_type(query)
+    return WEIGHT_PROFILES.get(qtype, WEIGHT_PROFILES["mixed"])
+
+
+def decompose_query(model: str, query: str) -> list[str]:
+    simple_splits = re.split(r'\s+(?:болон|ба|бол|and|or|vs\.?|versus)\s+', query, flags=re.IGNORECASE)
+    if len(simple_splits) > 1 and all(len(s.strip()) > 3 for s in simple_splits):
+        return [s.strip() for s in simple_splits if s.strip()]
+
+    if not _ollama_ping():
+        return [query]
+
+    prompt = (
+        "Break down this search query into 2-4 simpler sub-queries if it contains multiple questions.\n"
+        "If it's already simple, return it as-is.\n"
+        "Output ONLY the sub-queries, one per line. No numbering, no explanation.\n\n"
+        f"Query: {query}\n\nSub-queries:"
+    )
+    result = _ollama_call_simple(model, prompt, timeout=8)
+    if not result:
+        return [query]
+
+    subqueries = [sq.strip().strip('-•').strip() for sq in result.split('\n') if sq.strip()]
+    subqueries = [sq for sq in subqueries if len(sq) > 3 and sq.lower() != query.lower()]
+
+    return subqueries[:4] if subqueries else [query]
+
+
+_llm_enhance_cache: dict[str, dict] = {}
+
+def combined_llm_enhance(model: str, query: str) -> dict:
+    cache_key = f"{model}:{query.lower().strip()}"
+    if cache_key in _llm_enhance_cache:
+        return _llm_enhance_cache[cache_key]
+
+    _default = {"rewritten": query, "keywords": [], "intent": "unknown", "enhanced_query": query}
+
+    if not _ollama_ping():
+        return _default
+
+    prompt = (
+        "You are a search optimization assistant.\n"
+        "Given a user query, provide ALL of the following in a single JSON response:\n\n"
+        "1. rewritten_query: An improved search query (6-14 words, keyword-rich, "
+        "expand abbreviations like JLPT→Japanese Language Proficiency Test N1 N2 N3)\n"
+        "2. keywords: Array of 5-10 search keywords (include original language + "
+        "English/Japanese equivalents, domain terms, related concepts)\n"
+        "3. intent: Brief description of what the user wants to find\n\n"
+        "Output ONLY valid JSON, no markdown, no explanation.\n"
+        "Example: {\"rewritten_query\":\"JLPT N3 score result Japanese Language Proficiency Test\","
+        "\"keywords\":[\"jlpt\",\"n3\",\"japanese\",\"proficiency\",\"score\",\"合格\",\"日本語能力試験\"],"
+        "\"intent\":\"find JLPT test score\"}\n\n"
+        f"Query: {query}\n\nJSON:"
+    )
+
+    result = _ollama_call_simple(model, prompt, timeout=12)
+    if not result:
+        return _default
+
+    out = _default
+    try:
+        match = re.search(r'\{[^{}]+\}', result, re.DOTALL)
+        if match:
+            data = json.loads(match.group())
+            rewritten = data.get("rewritten_query", "").strip()
+            keywords = [str(k).lower().strip() for k in data.get("keywords", [])
+                       if isinstance(k, str) and 2 <= len(k.strip()) <= 40][:12]
+            intent = data.get("intent", "unknown")
+
+            out = {
+                "rewritten": rewritten if rewritten and len(rewritten) < 200 else query,
+                "keywords": keywords,
+                "intent": intent,
+                "enhanced_query": rewritten or query,
+            }
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    if out is _default:
+        tokens = re.findall(r'\w+', result.lower(), re.UNICODE)
+        out = {
+            "rewritten": query,
+            "keywords": [t for t in tokens if 2 <= len(t) <= 30][:8],
+            "intent": "unknown",
+            "enhanced_query": query,
+        }
+
+    if len(_llm_enhance_cache) >= 32:
+        _llm_enhance_cache.clear()
+    _llm_enhance_cache[cache_key] = out
+    return out
+
+
+def semantic_boost_query(model: str, query: str, context_hint: str = "") -> dict:
+    data = combined_llm_enhance(model, query)
+    return {
+        "enhanced_query": data["enhanced_query"],
+        "keywords": data["keywords"],
+        "intent": data["intent"],
+        "synonyms": [],
+    }
+
+
+def calculate_confidence_score(chunk: dict, query: str, weights: dict) -> float:
+    score = chunk.get("score", 0.0)
+    v_score = chunk.get("vector_score", 0.0)
+    b_score = chunk.get("bm25_score", 0.0)
+
+    confidence = score
+
+    match_methods = sum([
+        v_score > 0.3,
+        b_score > 0.3,
+        chunk.get("_kw", False) or bool(chunk.get("_kw_fallback")) or bool(chunk.get("_filename_kw")),
+        bool(chunk.get("_semantic")),
+        chunk.get("_rel", 0) > 0.3
+    ])
+    if match_methods >= 2:
+        confidence += 0.15
+    if match_methods >= 3:
+        confidence += 0.10
+
+    if "rerank_score" in chunk and chunk["rerank_score"] > 0.5:
+        confidence += 0.10
+
+    if chunk.get("_rel", 0) > 0.5:
+        confidence += 0.05
+
+    q_words = set(re.findall(r'\w+', query.lower(), re.UNICODE))
+    text_lower = chunk.get("text", "").lower()
+    word_hits = sum(1 for w in q_words if len(w) > 2 and w in text_lower)
+    if word_hits >= 3:
+        confidence += 0.05
+
+    return min(confidence, 1.0)
+
+
+def enhanced_search_pipeline(store, query: str, model: str, top_k: int,
+                             use_reranker: bool, debug: bool) -> tuple[list, dict]:
+    meta = {"query_type": "", "sub_queries": [], "enhanced": "", "weights": {}, "ollama_kws": []}
+
+    qtype = classify_query_type(query)
+    weights = WEIGHT_PROFILES.get(qtype, WEIGHT_PROFILES["mixed"])
+    meta["query_type"] = qtype
+    meta["weights"] = weights
+
+    is_personal = _is_personal_query(query)
+    if is_personal:
+        meta["personal"] = True
+
+    if debug:
+        print(f"  📊 Query type: {qtype} | weights: bm25={weights['bm25']:.2f} vec={weights['vector']:.2f} kw={weights['keyword']:.2f}")
+
+    use_llm = bool(model and model != "(олдсонгүй)" and _ollama_ping())
+    ollama_kws: list = []
+    rewritten_query = query
+    expansions = expand_query(query)
+
+    llm_future = None
+    if use_llm:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        _llm_pool = _TPE(max_workers=1)
+        llm_future = _llm_pool.submit(combined_llm_enhance, model, query)
+
+    all_results = []
+    seen_texts = set()
+
+    # Table retrieval disabled for speed
+    table_candidates = []
+
+    qe = store.engine.encode([query], is_query=True)
+    search_k = min(max(top_k * 10, 50), len(store.chunks))
+    vs, vi = store.faiss_idx.search(qe, search_k)
+    vmx = max(float(vs[0][0]), 1e-9)
+    vh = {int(i): float(s)/vmx for s, i in zip(vs[0], vi[0]) if i >= 0}
+
+    bm25_queries = _build_bm25_queries(query, expansions)
+    bh: dict = {}
+    for bq in bm25_queries:
+        for idx, sc in store.bm25.search(bq, top_k=search_k):
+            bh[idx] = max(bh.get(idx, 0.0), sc)
+    bmx = max(bh.values(), default=1e-9)
+
+    _domain_set = set(_ABBR.keys()) | set(_DOMAIN_EXPAND.keys())
+    q_words_lower = [w for w in re.findall(r"\w+", query.lower(), re.UNICODE)
+                     if len(w) >= 2 and w not in _FNAME_STOP]
+    strong_pool = [w for w in q_words_lower
+                   if w in _domain_set or len(w) >= 5 or any(ch.isdigit() for ch in w)]
+
+    for idx in set(vh) | set(bh):
+        chunk = store.chunks[int(idx)]
+        text_key = _chunk_key(chunk)
+        if text_key in seen_texts:
+            continue
+        seen_texts.add(text_key)
+
+        v_score = vh.get(int(idx), 0.0)
+        b_score = bh.get(int(idx), 0.0) / bmx
+        text_lower = chunk["text"].lower()
+
+        kw_score = 0.0
+        q_lower = query.lower()
+        if q_lower in text_lower:
+            kw_score = 1.0
+        else:
+            words = [w for w in re.findall(r'\w+', q_lower, re.UNICODE) if len(w) > 2]
+            kw_score = sum(1 for w in words if w in text_lower) / len(words) if words else 0.0
+
+        combined = (weights["vector"] * v_score +
+                    weights["bm25"] * b_score +
+                    weights["keyword"] * kw_score)
+
+        file_rel = _file_relevance_score(chunk, query, expansions)
+        if file_rel > 0:
+            combined = min(combined + file_rel * 1.0, 1.0)
+
+        if strong_pool:
+            pool_hits = [w for w in strong_pool if w in text_lower]
+            if pool_hits:
+                strong_floor = min(0.72 + (len(pool_hits) - 1) * 0.10, 0.95)
+                if strong_floor > combined:
+                    combined = strong_floor
+
+        if is_personal and _is_personal_doc(chunk):
+            combined = min(combined + 0.20, 1.0)
+
+        all_results.append({
+            **chunk,
+            "score": combined,
+            "vector_score": v_score,
+            "bm25_score": b_score,
+            "keyword_score": kw_score,
+            "_file_rel": file_rel,
+            "_personal_boost": (is_personal and _is_personal_doc(chunk)),
+        })
+
+    kw_fallback_terms = _build_keyword_fallback_terms(query, expansions)
+    for term in kw_fallback_terms[:6]:
+        for c in store._keyword_search(term, top_k=min(top_k * 3, 30)):
+            text_key = _chunk_key(c)
+            if text_key in seen_texts:
+                continue
+            seen_texts.add(text_key)
+            c = dict(c)
+            file_rel = _file_relevance_score(c, query, expansions)
+            base = max(0.56, float(c.get("score", 0.0)))
+            if file_rel > 0:
+                base = min(base + file_rel * 0.25, 0.95)
+            c["score"] = base
+            c["_kw_fallback"] = term
+            c["_file_rel"] = file_rel
+            all_results.append(c)
+
+    fname_seen = {_chunk_key(r) for r in all_results}
+    fname_extra = _ensure_filename_candidates(store, query, expansions, fname_seen)
+    if fname_extra:
+        all_results.extend(fname_extra)
+
+    if llm_future:
+        try:
+            llm_data = llm_future.result(timeout=15)
+            rewritten_query = llm_data.get("rewritten", query)
+            ollama_kws = llm_data.get("keywords", [])
+
+            if rewritten_query != query:
+                meta["enhanced"] = rewritten_query
+            if ollama_kws:
+                meta["ollama_kws"] = ollama_kws
+
+            for kw in ollama_kws:
+                kl = str(kw).lower().strip()
+                if kl and kl not in strong_pool:
+                    strong_pool.append(kl)
+
+            for kw in ollama_kws[:5]:
+                if len(kw) < 3:
+                    continue
+                for idx, sc in store.bm25.search(kw, top_k=min(top_k * 2, 20)):
+                    chunk = store.chunks[idx]
+                    text_key = _chunk_key(chunk)
+                    if text_key in seen_texts:
+                        continue
+                    seen_texts.add(text_key)
+                    txt_l = chunk["text"].lower()
+                    pool_h = [w for w in strong_pool if w in txt_l]
+                    base = min(0.65 + len(pool_h) * 0.15, 0.95) if pool_h else 0.45
+                    all_results.append({**chunk, "score": base,
+                        "vector_score": 0.0, "bm25_score": sc,
+                        "keyword_score": 0.0, "_ollama_kw": kw})
+
+            if rewritten_query.lower() != query.lower():
+                rq_e = store.engine.encode([rewritten_query], is_query=True)
+                rvs, rvi = store.faiss_idx.search(rq_e, min(top_k * 5, len(store.chunks)))
+                rvmx = max(float(rvs[0][0]), 1e-9)
+                for sc, idx in zip(rvs[0], rvi[0]):
+                    if idx < 0: continue
+                    chunk = store.chunks[int(idx)]
+                    text_key = _chunk_key(chunk)
+                    if text_key in seen_texts: continue
+                    seen_texts.add(text_key)
+                    all_results.append({**chunk, "score": float(sc)/rvmx * 0.85,
+                        "vector_score": float(sc)/rvmx, "bm25_score": 0.0,
+                        "keyword_score": 0.0, "_subquery": rewritten_query[:20]})
+
+            if debug:
+                print(f"  ⚡ LLM: {rewritten_query[:40]} | kw={ollama_kws[:5]}")
+        except Exception as e:
+            if debug: print(f"  ⚠️ LLM timeout/error: {e}")
+        finally:
+            _llm_pool.shutdown(wait=False)
+
+    all_results.sort(key=lambda x: x["score"], reverse=True)
+
+    for r in all_results:
+        r["confidence"] = calculate_confidence_score(r, query, weights)
+
+    candidates = all_results[:top_k * 3]
+    if use_reranker and store.reranker.available and len(candidates) > 1:
+        q_ascii = sum(1 for ch in query if ord(ch) < 128) / max(len(query), 1)
+        if q_ascii > 0.7:
+            candidates = store.reranker.rerank(query, candidates, top_k)
+            for r in candidates:
+                r["confidence"] = calculate_confidence_score(r, query, weights)
+
+    return candidates[:top_k], meta
+
+
+# ── Filename-priority injection ──────────────────────────────
+_FNAME_STOP = {
+    "вэ","бэ","юу","яу","гэж","гэх","нь","ын","ийн","бол","байна","дэх","дотор",
+    "the","is","a","of","and","in","to","for","with","on","at","by","an",
+}
+
+_LEVEL_CODES_RE = re.compile(r'^[nN]\d$')
+
+def _ensure_filename_candidates(store, query: str, expansions: list,
+                                 seen_texts: set) -> list:
+    q_words = [w for w in re.findall(r"\w+", query.lower(), re.UNICODE)
+               if len(w) >= 2 and w not in _FNAME_STOP]
+    if not q_words:
+        return []
+
+    exp_words = set(q_words)
+    for exp in expansions[1:6]:
+        for w in re.findall(r"\w+", exp.lower(), re.UNICODE):
+            if len(w) >= 2 and w not in _FNAME_STOP:
+                exp_words.add(w)
+
+    forced = []
+    for ch in store.chunks:
+        src = _normalize_filename(ch.get("source", "")).lower()
+        hits = sum(1 for w in q_words if w in src)
+        if hits == 0:
+            continue
+
+        text_key = _chunk_key(ch)
+        if text_key in seen_texts:
+            continue
+
+        file_ratio  = hits / len(q_words)
+        text_lower  = ch["text"].lower()
+        text_hits   = sum(1 for w in exp_words if w in text_lower)
+        text_ratio  = text_hits / max(len(exp_words), 1)
+
+        if file_ratio >= 1.0:
+            base_score = 0.75 + text_ratio * 0.15
+        elif file_ratio >= 0.5:
+            base_score = 0.60 + text_ratio * 0.20
+        else:
+            base_score = 0.45 + text_ratio * 0.20
+
+        forced.append({
+            **ch,
+            "score":         min(base_score, 1.0),
+            "vector_score":  0.0,
+            "bm25_score":    0.0,
+            "keyword_score": text_ratio,
+            "_file_rel":     file_ratio,
+            "_forced":       True,
+        })
+        seen_texts.add(text_key)
+
+    forced.sort(key=lambda x: (x["_file_rel"], x["score"]), reverse=True)
+    return forced
+
+
+# ── File relevance filter ────────────────────────────────────
+
+def _file_relevance_score(chunk: dict, query: str, expansions: list) -> float:
+    src  = _normalize_filename(chunk.get("source", "")).lower()
+    text = chunk.get("text", "").lower()
+
+    STOP = {"вэ","бэ","юу","яу","гэж","гэх","нь","ын","ийн","бол","байна",
+            "хэд","ямар","хаана","хэзээ","хэн","юуг","аль","the","is","a","of"}
+    q_words = [w for w in re.findall(r"\w+", query.lower(), re.UNICODE)
+               if len(w) >= 2 and w not in STOP]
+
+    score = 0.0
+
+    if q_words:
+        src_hits = sum(1 for w in q_words if w in src)
+        hit_ratio = src_hits / len(q_words)
+
+        if hit_ratio == 1.0:
+            score += 1.0
+        elif hit_ratio >= 0.67:
+            score += 0.75
+        elif hit_ratio >= 0.5:
+            score += 0.5
+        elif src_hits >= 1:
+            score += 0.3
+
+    for exp_term in expansions[1:6]:
+        exp_words = [w for w in re.findall(r"\w+", exp_term.lower(), re.UNICODE)
+                     if len(w) >= 3 and w not in STOP]
+        for w in exp_words:
+            if w in src:
+                score += 0.2
+                break
+
+    all_terms = [query.lower()] + [e.lower() for e in expansions[:3]]
+    for term in all_terms:
+        for w in re.findall(r"\w+", term, re.UNICODE):
+            if len(w) >= 3 and w not in STOP and w in text:
+                score += 0.04
+
+    return min(score, 1.0)
+
+# ── Pattern matching ─────────────────────────────────────────
+def extract_smart_info(content, query):
+    extracted = []
+    q_lower = (query or "").lower()
+    q_words = {w for w in re.findall(r"\w+", q_lower, re.UNICODE) if len(w) >= 2}
+    if not content:
+        return []
+
+    kv_patterns = [
+        r"([A-Za-zА-Яа-яёүөЁҮӨ\w\s]{2,30})\s*[:=]\s*([^\n\r]{3,120})",
+        r"([A-Za-zА-Яа-яёүөЁҮӨ\w\s]{2,30})\s*[-–—]\s*([^\n\r]{3,120})",
+    ]
+    for pat in kv_patterns:
+        for key, val in re.findall(pat, content):
+            kc = key.strip().lower()
+            v = val.strip()
+            if not (2 < len(v) < 220):
+                continue
+            kw = set(re.findall(r"\w+", kc, re.UNICODE))
+            if q_words & kw or any(qw in kc for qw in q_words if len(qw) > 2):
+                extracted.append(f"✓ {key.strip()}: {v}")
+
+    cl = content.lower()
+    for word in q_words:
+        if len(word) < 3:
+            continue
+        m = re.search(re.escape(word), cl)
+        if not m:
+            continue
+        s = max(0, m.start() - 100)
+        e = min(len(content), m.end() + 150)
+        for line in content[s:e].split("\n"):
+            ln = line.strip()
+            if word in ln.lower() and 10 < len(ln) < 220 and len(extracted) < 8:
+                extracted.append(f"→ {ln}")
+        break
+
+    num_pat = (
+        r"([A-Za-zА-Яа-яёүөЁҮӨ\w\s]{2,25})\s*[:=]?\s*"
+        r"(\d+(?:[.,]\d+)?)\s*(%|хувь|percent|USD|₮|¥|\$|€|kg|km|м|cm|mm|GB|MB|TB|件|個|人|年|月|日)?"
+    )
+    for label, number, unit in re.findall(num_pat, content):
+        ll = label.strip().lower()
+        if any(qw in ll for qw in q_words if len(qw) > 2):
+            extracted.append(f"✓ {label.strip()}: {number}{unit or ''}")
+
+    ask_date = any(k in q_lower for k in ["date", "when", "хэзээ", "огноо", "он", "сар", "өдөр"])
+    if ask_date:
+        date_patterns = [
+            r"(\d{4})\s*[年/-]\s*(\d{1,2})\s*[月/-]?\s*(\d{1,2})?\s*日?",
+            r"(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})",
+        ]
+        for pat in date_patterns:
+            for dm in re.findall(pat, content):
+                ds = "/".join([d for d in dm if d])
+                if ds and ds not in " ".join(extracted):
+                    extracted.append(f"📅 {ds}")
+                if len(extracted) >= 10:
+                    break
+
+    ask_contact = any(k in q_lower for k in ["email", "mail", "phone", "contact", "имэйл", "утас", "холбоо"])
+    if ask_contact:
+        em = re.findall(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", content)
+        ph = re.findall(r"(?:\+?\d[\d\s()\-]{7,}\d)", content)
+        if em:
+            extracted.append(f"✓ Email: {em[0]}")
+        if ph:
+            extracted.append(f"✓ Phone: {ph[0].strip()}")
+
+    seen, unique = set(), []
+    for item in extracted:
+        k = re.sub(r"[^\w\s]", "", item.lower())
+        if k not in seen and len(k) > 5:
+            seen.add(k)
+            unique.append(item)
+    return unique[:8]
+
+
+# ── Ollama (cached) ──────────────────────────────────────────
+_find_ollama_cache = None
+def _find_ollama():
+    global _find_ollama_cache
+    if _find_ollama_cache is not None:
+        return _find_ollama_cache or None
+    p = shutil.which("ollama")
+    if p: _find_ollama_cache = p; return p
+    if sys.platform == "win32":
+        for c in [Path(os.environ.get("LOCALAPPDATA",""))/"Programs/Ollama/ollama.exe",
+                  Path.home()/"AppData/Local/Programs/Ollama/ollama.exe"]:
+            if c.exists(): _find_ollama_cache = str(c); return str(c)
+    _find_ollama_cache = ""
+    return None
+
+_ping_cache = {"ok": None, "ts": 0.0}
+def _ollama_ping():
+    now = time.perf_counter()
+    if _ping_cache["ok"] is not None and (now - _ping_cache["ts"]) < 30.0:
+        return _ping_cache["ok"]
+    try:
+        import urllib.request
+        urllib.request.urlopen(f"{OLLAMA_HOST}/api/tags", timeout=2).close()
+        _ping_cache.update(ok=True, ts=now); return True
+    except Exception:
+        _ping_cache.update(ok=False, ts=now); return False
+
+def get_ollama_models():
+    models = []
+    try:
+        import ollama; r = ollama.list()
+        ml = r.get("models",[]) if isinstance(r,dict) else getattr(r,"models",[]) or []
+        for m in ml:
+            n = m.get("model",m.get("name","")) if isinstance(m,dict) else getattr(m,"model","")
+            if n: models.append(n)
+        if models: return models
+    except Exception: pass
+    try:
+        exe = _find_ollama()
+        if exe:
+            flags = {"creationflags":subprocess.CREATE_NO_WINDOW} if sys.platform=="win32" else {}
+            r = subprocess.run([exe,"list"], capture_output=True, text=True, timeout=10, **flags)
+            for line in r.stdout.strip().split("\n")[1:]:
+                p = line.split()
+                if p and p[0].lower() != "name": models.append(p[0])
+            if models: return models
+    except Exception: pass
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+            urllib.request.Request(f"{OLLAMA_HOST}/api/tags"), timeout=5) as resp:
+            for m in json.loads(resp.read()).get("models",[]):
+                n = m.get("model") or m.get("name","")
+                if n: models.append(n)
+    except Exception: pass
+    return models
+
+def ask_stream(model, question, context):
+    exp_terms = expand_query(question)
+    exp_hint  = ", ".join(exp_terms[1:4]) if len(exp_terms) > 1 else ""
+
+    # Асуултын хэлийг тодорхойлох
+    mn_chars = sum(1 for c in question if '\u1800' <= c <= '\u18af')
+    jp_chars  = sum(1 for c in question if '\u3040' <= c <= '\u30ff' or '\u4e00' <= c <= '\u9fff')
+    if mn_chars > 2:
+        reply_lang = "Монгол хэлээр хариул."
+    elif jp_chars > 2:
+        reply_lang = "日本語で答えてください。"
+    else:
+        reply_lang = "Answer in English."
+
+    prompt = f"""Та мэдлэгийн санд суурилсан туслах AI юм.
+Доорх баримт хэсгүүдийг ашиглан хэрэглэгчийн асуултад ШУУД хариул.
+{reply_lang}
+{f"Хайлтын нэр томьёо: {exp_hint}" if exp_hint else ""}
+
+ДҮРЭМ:
+- Баримтуудад байгаа мэдээллийг ашиглан шууд хариул
+- Эх сурвалжийг [1], [2] гэж дурд
+- Хариулт богино, тодорхой байх ёстой
+- Баримтад байгаа мэдээллийг ЗААВАЛ ашигла — "олдсонгүй" гэж бүү хэл хэрэв мэдээлэл байгаа бол
+- Хэрэв баримтад байхгүй бол л "Мэдлэгийн санд энэ мэдээлэл олдсонгүй" гэ
+
+=== БАРИМТ ХЭСГҮҮД ===
+{context}
+======================
+
+АСУУЛТ: {question}
+
+ХАРИУЛТ:"""
+    if not _ollama_ping():
+        yield "❌ Ollama ажиллахгүй байна.\n`ollama serve` командыг тусдаа терминалд ажиллуулна уу."; return
+
+    exe = _find_ollama()
+    if exe:
+        try:
+            flags = {"creationflags":subprocess.CREATE_NO_WINDOW} if sys.platform=="win32" else {}
+            proc  = subprocess.Popen([exe,"run",model,"--nowordwrap"],
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                        text=True, encoding="utf-8", errors="replace", bufsize=1, **flags)
+            proc.stdin.write(prompt); proc.stdin.close()
+            for line in proc.stdout:
+                if line: yield line
+            proc.wait(timeout=OLLAMA_TIMEOUT); return
+        except subprocess.TimeoutExpired:
+            try: proc.kill()
+            except Exception: pass
+            yield f"\n\n⏱️ Timeout ({OLLAMA_TIMEOUT}с). `OLLAMA_TIMEOUT` утгыг нэмнэ үү."; return
+        except Exception: pass
+
+    import socket, urllib.request
+    try:
+        data = json.dumps({"model":model,"prompt":prompt,"stream":True,"options":{"num_predict":2048}}).encode()
+        req  = urllib.request.Request(f"{OLLAMA_HOST}/api/generate", data=data,
+                                       headers={"Content-Type":"application/json"})
+        old  = socket.getdefaulttimeout(); socket.setdefaulttimeout(OLLAMA_TIMEOUT)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                for raw in resp:
+                    raw = raw.strip()
+                    if not raw: continue
+                    try:
+                        d = json.loads(raw)
+                        if d.get("error"): yield f"\n\n❌ {d['error']}"; return
+                        if d.get("response"): yield d["response"]
+                        if d.get("done"): return
+                    except json.JSONDecodeError: continue
+        finally: socket.setdefaulttimeout(old)
+    except Exception as e:
+        err = str(e).lower()
+        if "timed out" in err or "timeout" in err:
+            yield f"\n\n⏱️ Timeout. `OLLAMA_TIMEOUT={OLLAMA_TIMEOUT}` → `1200` | жижиг загвар: `qwen2.5:0.5b`"
+        else: yield f"\n\nOllama алдаа: {e}"
+
+
+# ── Gradio helpers ───────────────────────────────────────────
+store = None
+
+def _chat_append(h, u, b):
+    if _USE_MESSAGES_FORMAT: h.append({"role":"user","content":u}); h.append({"role":"assistant","content":b})
+    else: h.append((u,b))
+    return h
+
+def _chat_update_last(h, b):
+    if _USE_MESSAGES_FORMAT: h[-1]["content"] = b
+    else: h[-1] = (h[-1][0], b)
+    return h
+
+def _make_chatbot():
+    if _USE_MESSAGES_FORMAT:
+        try: return gr.Chatbot(label="Ярилцлага", height=500, type="messages")
+        except TypeError: pass
+    return gr.Chatbot(label="Ярилцлага", height=500)
+
+
+# ── Advanced RAG helpers ─────────────────────────────────────
+
+def _ollama_call_simple(model: str, prompt: str, timeout: int = 15) -> str:
+    exe = _find_ollama()
+    if exe:
+        try:
+            flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+            proc  = subprocess.Popen(
+                [exe, "run", model, "--nowordwrap"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, encoding="utf-8", errors="replace", **flags)
+            out, _ = proc.communicate(input=prompt, timeout=timeout)
+            return out.strip()
+        except Exception:
+            pass
+    import socket, urllib.request
+    try:
+        data = json.dumps({"model": model, "prompt": prompt, "stream": False}).encode()
+        req  = urllib.request.Request(f"{OLLAMA_HOST}/api/generate", data=data,
+                                       headers={"Content-Type": "application/json"})
+        old  = socket.getdefaulttimeout(); socket.setdefaulttimeout(timeout)
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return json.loads(resp.read()).get("response", "").strip()
+        finally:
+            socket.setdefaulttimeout(old)
+    except Exception:
+        return ""
+
+
+def rewrite_query(model: str, question: str) -> str:
+    data = combined_llm_enhance(model, question)
+    return data["rewritten"]
+
+
+def ollama_extract_keywords(model: str, query: str) -> list:
+    data = combined_llm_enhance(model, query)
+    return data["keywords"]
+
+
+def grade_chunks(model: str, question: str, chunks: list, max_chunks: int = 8) -> list:
+    if not _ollama_ping() or not chunks:
+        return chunks
+
+    check_n = min(max_chunks, 5)
+    graded = []
+    for chunk in chunks[:check_n]:
+        src     = chunk.get("source", "?")
+        preview = chunk.get("text", "")[:300].replace("\n", " ")
+        prompt  = (
+            "You are a relevance grader. "
+            "Determine if the document chunk is relevant to the user question.\n"
+            "Answer with ONLY 'YES' or 'NO'.\n\n"
+            f"Question: {question}\n\n"
+            f"Document chunk ({src}):\n{preview}\n\n"
+            "Is this chunk relevant? Answer YES or NO:"
+        )
+        answer = _ollama_call_simple(model, prompt, timeout=8).upper()
+        if "NO" in answer and "YES" not in answer:
+            continue
+        graded.append(chunk)
+
+    graded.extend(chunks[check_n:])
+    return graded if graded else chunks
+
+
+def hyde_generate(model: str, question: str) -> str:
+    if not _ollama_ping():
+        return ""
+    prompt = (
+        "Write a short hypothetical answer (2-4 sentences) to the following question. "
+        "This is used for semantic search only — NOT shown to the user. "
+        "Be specific and use domain terminology that might appear in source documents. "
+        "Output ONLY the answer text, no preamble.\n\n"
+        f"Question: {question}\n\nHypothetical answer:"
+    )
+    result = _ollama_call_simple(model, prompt, timeout=10)
+    return result.strip() if result and len(result.strip()) > 20 else ""
+
+
+def self_reflect_search(store, model: str, question: str,
+                        results: list, top_k: int) -> list:
+    if not results or not _ollama_ping():
+        return results
+
+    ctx_preview = "\n".join(
+        f"[{i+1}] {r.get('source','?')}: {r['text'][:180].replace(chr(10),' ')}"
+        for i, r in enumerate(results[:4])
+    )
+    reflect_prompt = (
+        f"Question: {question}\n\n"
+        f"Retrieved {len(results)} document chunks. Preview:\n{ctx_preview}\n\n"
+        "Do these chunks contain enough information to fully answer the question? "
+        "Answer ONLY 'YES' or 'NO':"
+    )
+    verdict = _ollama_call_simple(model, reflect_prompt, timeout=8).upper()
+
+    if "YES" in verdict:
+        return results
+
+    refine_prompt = (
+        f"The search for '{question}' returned insufficient results.\n"
+        "Write ONE alternative search query using different keywords "
+        "(output ONLY the query, no explanation):"
+    )
+    new_q = _ollama_call_simple(model, refine_prompt, timeout=8).strip().strip('"\'')
+    if not new_q or len(new_q) < 4 or new_q.lower() == question.lower():
+        return results
+
+    try:
+        extra, _ = enhanced_search_pipeline(store, new_q, model, top_k, False, False)
+        seen = {_chunk_key(r) for r in results}
+        added = 0
+        for c in extra:
+            if _chunk_key(c) not in seen:
+                c = dict(c)
+                c["score"] *= 0.85
+                c["_self_rag"] = True
+                c["_self_rag_q"] = new_q[:60]
+                results.append(c)
+                seen.add(_chunk_key(c))
+                added += 1
+        if added:
+            results.sort(key=lambda x: x["score"], reverse=True)
+    except Exception:
+        pass
+
+    return results[:top_k + 3]
+
+
+def summarize_chunks_for_context(model: str, chunks: list,
+                                  question: str, max_raw_len: int = 1200) -> str:
+    ollama_ok = _ollama_ping()
+    parts = []
+
+    for i, r in enumerate(chunks, 1):
+        src  = r.get("source", "?")
+        text = r.get("text", "").strip()
+
+        if ollama_ok and len(text) > max_raw_len:
+            sum_prompt = (
+                f"Summarize the following document excerpt in 3-5 sentences, "
+                f"focusing ONLY on information relevant to: '{question}'\n"
+                "Output ONLY the summary, no preamble.\n\n"
+                f"{text[:2500]}"
+            )
+            summary = _ollama_call_simple(model, sum_prompt, timeout=12)
+            if summary and len(summary.strip()) > 30:
+                text = f"[Summary] {summary.strip()}"
+            else:
+                text = text[:max_raw_len]
+
+        parts.append(f"[{i}] Source: {src}\n{text}")
+
+    return "\n\n---\n\n".join(parts)
+
+
+def multi_step_search(store, question: str, rewritten: str,
+                      top_k: int, use_reranker: bool, debug: bool) -> list:
+    r1 = store.search(question, top_k=top_k, use_reranker=False, debug=debug)
+
+    r2 = []
+    if rewritten.lower() != question.lower():
+        r2 = store.search(rewritten, top_k=top_k, use_reranker=False, debug=False)
+
+    seen   = {c["text"][:80] for c in r1}
+    merged = list(r1)
+    for c in r2:
+        if c["text"][:80] not in seen:
+            seen.add(c["text"][:80])
+            c = dict(c); c["score"] *= 0.9; c["_r2"] = True
+            merged.append(c)
+
+    merged.sort(key=lambda x: x["score"], reverse=True)
+
+    if use_reranker and store.reranker.available and len(merged) > 1:
+        q_ascii = sum(1 for ch in question if ord(ch) < 128) / max(len(question), 1)
+        if q_ascii > 0.7:
+            merged = store.reranker.rerank(question, merged, top_k)
+            return merged
+
+    return merged[:top_k]
+
+
+# ── Gradio functions ─────────────────────────────────────────
+def index_folder(folder, emb_model, save_name, progress=gr.Progress(track_tqdm=False)):
+    global store
+    folder = (folder or "").strip().strip('"\'')
+    dd, info = _dd_and_info()
+    if not folder or not os.path.exists(folder): return f"❌ Фолдер олдсонгүй: {folder}", dd, info
+    name = (save_name or "").strip() or Path(folder).name
+
+    t_total = time.perf_counter()
+    progress(0.0, desc="Файл уншиж байна")
+    t0 = time.perf_counter()
+    docs, skipped = load_documents(folder, progress)
+    print(f"  ⏱️ Файл уншилт: {time.perf_counter()-t0:.1f}с ({len(docs)} файл)")
+    if not docs: return "⚠️ Файл олдсонгүй.\n" + "\n".join(f"  {s}" for s in skipped[:8]), dd, info
+    key = emb_model or DEFAULT_EMBED
+    fid = hashlib.md5(safe_encode(folder)).hexdigest()
+
+    try:
+        t0 = time.perf_counter()
+        store = HybridStore(key=key); progress(0.31, desc=f"Загвар: {key}")
+        print(f"  ⏱️ HybridStore init: {time.perf_counter()-t0:.1f}с")
+        t0 = time.perf_counter()
+        n = store.build(docs, progress, folder_id=fid)
+        el_build = time.perf_counter()-t0
+        print(f"  ⏱️ Build нийт: {el_build:.1f}с")
+        t0 = time.perf_counter()
+        store.save(_index_base(name))
+        print(f"  ⏱️ Save: {time.perf_counter()-t0:.1f}с")
+    except RuntimeError as e: return str(e), *_dd_and_info()
+    sname = _sanitize_name(name); dd, info = _dd_and_info(sname)
+    el_total = time.perf_counter()-t_total
+    sk = f"\n\nАлгасагдсан {len(skipped)}" if skipped else ""
+    return (f"✅ **{len(docs)} файл** → **{n:,} chunk** | {el_total:.0f}с\n"
+            f"🧠 {key} | {_gpu_str()} | 💾 `{sname}`{sk}"), dd, info
+
+def load_index(name, progress=gr.Progress(track_tqdm=False)):
+    global store
+    dd, info = _dd_and_info(name)
+    if not name or name == "(байхгүй)": return "⚠️ Индекс сонгоно уу", dd, info
+    progress(0.0, desc=f"Ачааллаж байна: {name}")
+    store = HybridStore()
+    if not store.load(_index_base(name)): store = None; return "❌ Ачаалж чадсангүй", *_dd_and_info(name)
+    progress(1.0, desc="✅ Бэлэн!")
+    dd, info = _dd_and_info(name)
+    return f"✅ **{name}** ачааллагдлаа\n{info}", dd, info
+
+def delete_index(name):
+    if not name or name == "(байхгүй)": return "⚠️ Сонгоно уу", *_dd_and_info()
+    base = Path(_index_base(name))
+    for ext in [".faiss",".meta"]:
+        p = base.with_suffix(ext)
+        if p.exists(): p.unlink()
+    return f"🗑️ **{name}** устгагдлаа", *_dd_and_info()
+
+def refresh_indexes():   return _dd_and_info()
+def show_index_info(n):  return _index_info(n)
+
+def refresh_models():
+    m = get_ollama_models()
+    return gr.update(choices=m or ["(олдсонгүй)"], value=m[0] if m else "(олдсонгүй)")
+
+def _score_all_files(store, question: str, expansions: list, ollama_kws: list = None) -> list:
+    if not store or not store.chunks:
+        return []
+
+    q_lower = question.lower()
+    q_words = [w for w in re.findall(r"\w+", q_lower, re.UNICODE)
+               if len(w) >= 2 and w not in _FNAME_STOP]
+    kw_terms = _build_keyword_fallback_terms(question, expansions, ollama_kws or [])
+
+    _domain_set = set(_ABBR.keys()) | set(_DOMAIN_EXPAND.keys())
+    strong_pool = [w for w in q_words if w in _domain_set or len(w) >= 5 or any(ch.isdigit() for ch in w)]
+    if ollama_kws:
+        for kw in ollama_kws:
+            kl = kw.lower().strip()
+            if kl and kl not in strong_pool:
+                strong_pool.append(kl)
+
+    bm25_queries = _build_bm25_queries(question, expansions, ollama_kws or [])
+
+    bm25_raw: dict[int, float] = {}
+    for bq in bm25_queries:
+        for idx, sc in store.bm25.search(bq, top_k=len(store.chunks)):
+            bm25_raw[idx] = max(bm25_raw.get(idx, 0.0), sc)
+    bmx = max(bm25_raw.values(), default=1e-9)
+
+    file_scores: dict[str, dict] = {}
+    for idx, ch in enumerate(store.chunks):
+        src     = ch.get("source", "?")
+        raw_txt = ch.get("text", "")
+        txt     = raw_txt.lower()
+
+        b_norm  = bm25_raw.get(idx, 0.0) / bmx
+        kw_hits = sum(1 for w in kw_terms if len(w) >= 3 and w in txt)
+        kw_norm = min(kw_hits / max(min(len(kw_terms), 4), 1), 1.0)
+        frel    = _file_relevance_score(ch, question, expansions)
+
+        if strong_pool:
+            pool_hits = [w for w in strong_pool if w in txt]
+            strong_score = min(0.40 + (len(pool_hits) - 1) * 0.10, 0.95) if pool_hits else 0.0
+        else:
+            strong_score = kw_norm * 0.5 if kw_norm >= 0.5 else 0.0
+
+        combined_base = BM25_WEIGHT * b_norm + VECTOR_WEIGHT * kw_norm + frel * 0.3
+        combined = max(strong_score, combined_base)
+
+        if src not in file_scores or combined > file_scores[src]["score"]:
+            file_scores[src] = {
+                "score":  combined,
+                "bm25":   b_norm,
+                "kw":     kw_norm,
+                "frel":   frel,
+                "sample": raw_txt[:60].replace("\n", " "),
+            }
+
+    ranked = sorted(file_scores.items(), key=lambda x: x[1]["score"], reverse=True)
+    return [(src, v["score"], v["bm25"], v["kw"], v["frel"], v["sample"])
+            for src, v in ranked]
+
+
+def answer_stream(question, model, top_k, use_reranker, debug_mode, history):
+    if not question.strip(): yield history; return
+    if store is None or store.faiss_idx is None:
+        yield _chat_append(history, question, "⚠️ Эхлээд индекс ачааллана уу!"); return
+
+    t_start = time.perf_counter()
+
+    use_advanced = bool(model and model != "(олдсонгүй)")
+
+    if use_advanced:
+        results, search_meta = enhanced_search_pipeline(
+            store, question, model, int(top_k),
+            use_reranker, bool(debug_mode)
+        )
+    else:
+        results = store.search(question, top_k=int(top_k),
+                               use_reranker=use_reranker, debug=bool(debug_mode))
+        search_meta = {"query_type": "mixed", "sub_queries": [], "enhanced": "", "weights": {}}
+
+    t_search = time.perf_counter() - t_start
+
+    if not results:
+        yield _chat_append(history, question,
+            "🔍 Хайлтын үр дүн олдсонгүй.\n\n"
+            "**Зөвлөгөө:**\n"
+            "- Өөр үгээр эсвэл илүү товч асуугаарай\n"
+            "- Top-K утгыг нэмнэ үү (одоо: {})\n"
+            "- Debug горим асааж score-г шалгаарай".format(int(top_k)))
+        return
+
+    expansions_all   = expand_query(question)
+    ollama_kws_meta  = search_meta.get("ollama_kws", []) if use_advanced else []
+    all_file_scores  = _score_all_files(store, question, expansions_all, ollama_kws=ollama_kws_meta)
+    returned_srcs    = {r.get("source","") for r in results}
+
+    lines = ["**📊 Файл бүрийн оноо:**", "```"]
+    lines.append(f"{'#':<3} {'Score':>6} {'BM25':>5} {'KW':>5} {'FRel':>5}  Файл")
+    lines.append("-" * 72)
+    for rank, (src, sc, bm, kw, frel, _s) in enumerate(all_file_scores, 1):
+        tag   = "[top]" if src in returned_srcs else "     "
+        fname = src[-46:] if len(src) > 46 else src
+        lines.append(f"{rank:<3} {sc:>6.3f} {bm:>5.2f} {kw:>5.2f} {frel:>5.2f}  {tag} {fname}")
+    lines.append("```\n")
+    ranking_block = "\n".join(lines) + "\n"
+
+    trace_block = ""
+    if debug_mode and store.chunks:
+        expansions_tr   = expand_query(question)
+        all_file_scores2 = _score_all_files(store, question, expansions_tr)
+        returned_srcs2   = {r.get("source","?") for r in results}
+        trace_lines = ["\n---", "**🔬 Score Trace — нарийвчилсан:**\n```"]
+        trace_lines.append(f"{'#':<3} {'Score':>6} {'BM25':>5} {'KW':>5} {'FRel':>5}  Статус  Файл")
+        trace_lines.append("-" * 75)
+        for rank, (src, sc, bm, kw, frel, sample) in enumerate(all_file_scores2, 1):
+            status = "✅ ret" if src in returned_srcs2 else "❌ miss"
+            fname  = src[-42:] if len(src) > 42 else src
+            trace_lines.append(
+                f"{rank:<3} {sc:>6.3f} {bm:>5.2f} {kw:>5.2f} {frel:>5.2f}  {status}  {fname}"
+            )
+            if sample:
+                trace_lines.append(f"    ↳ {sample[:60]}")
+        trace_lines.append("```\n")
+        trace_block = "\n".join(trace_lines)
+
+    expansions = expand_query(question)
+    exp_str    = ", ".join(f"`{e}`" for e in expansions[1:4]) if len(expansions) > 1 else ""
+    info_parts = []
+
+    info_parts.append(f"**⏱️ Хайлт:** {t_search:.1f}с")
+
+    if debug_mode and search_meta.get("query_type"):
+        qtype = search_meta["query_type"]
+        weights = search_meta.get("weights", {})
+        info_parts.append(f"**📊 Query type:** `{qtype}` | bm25={weights.get('bm25',0):.2f} vec={weights.get('vector',0):.2f} kw={weights.get('keyword',0):.2f}")
+
+    if search_meta.get("enhanced"):
+        info_parts.append(f"**🧠 Enhanced query:** `{search_meta['enhanced']}`")
+
+    if search_meta.get("sub_queries") and len(search_meta["sub_queries"]) > 1:
+        sq_str = ", ".join(f"`{sq}`" for sq in search_meta["sub_queries"][:3])
+        info_parts.append(f"**🔀 Sub-queries:** {sq_str}")
+
+    if exp_str:
+        info_parts.append(f"**🔍 Expansion:** {exp_str}")
+
+    if search_meta.get("ollama_kws"):
+        kw_str = ", ".join(f"`{k}`" for k in search_meta["ollama_kws"][:8])
+        info_parts.append(f"**🤖 Ollama keywords:** {kw_str}")
+
+    if search_meta.get("table_hits"):
+        tf = ", ".join(f"`{x}`" for x in search_meta.get("table_files",[])[:4])
+        info_parts.append(f"**📋 Table-first:** {search_meta['table_hits']} hit | {tf}")
+    if search_meta.get("table_answer"):
+        info_parts.append(f"**✅ Олдсон утга:** `{search_meta['table_answer']}`")
+
+    if search_meta.get("personal"):
+        personal_count = sum(1 for r in results if r.get("_personal_boost"))
+        info_parts.append(
+            f"**👤 Personal boost идэвхтэй** — CV/resume/entry sheet файлд +0.28 оноо "
+            f"({personal_count} chunk boost авсан)"
+        )
+
+    if any(r.get("_semantic") for r in results):
+        info_parts.append(f"**🧠 Semantic model:** `{SEMANTIC_REFERENCE_MODEL}`")
+
+    exp_block = "\n".join(info_parts) + "\n\n" if info_parts else ""
+
+    all_ext = []
+    for r in results:
+        found = extract_smart_info(r["text"], question)
+        if found: all_ext.extend(found)
+    seen, unique = set(), []
+    for item in all_ext:
+        k = re.sub(r'[^\w\s]','',item.lower())
+        if k not in seen and len(k)>5: seen.add(k); unique.append(item)
+    pattern_block = ("**🔎 Олдсон мэдээлэл:**\n"+"\n".join(unique)+"\n\n") if unique else ""
+
+    n_show = 5 if debug_mode else 3
+    plen   = 800 if debug_mode else 400
+    chunks_block = "**📄 Олдсон хэсгүүд:**\n"
+    for i, r in enumerate(results[:n_show], 1):
+        src     = r.get("source","?")
+        txt     = r.get("text","").strip()
+        score   = r.get("score",0)
+        confidence = r.get("confidence", score)
+        kw      = " 🔑" if (r.get("_kw") or r.get("_kw_fallback") or r.get("_filename_kw")) else ""
+
+        if confidence >= CONFIDENCE_THRESHOLD:
+            conf_icon = "✅"
+        elif confidence >= 0.5:
+            conf_icon = "🟡"
+        else:
+            conf_icon = "⚪"
+
+        preview = txt[:plen].replace("\n"," ").strip() + ("…" if len(txt)>plen else "")
+        rel_str = f" rel={r.get('_rel',0):.2f}" if r.get('_rel') else ""
+
+        if debug_mode:
+            extra_tags = []
+            if r.get("_table"):
+                kv = r.get("_table_kv","")[:20]
+                extra_tags.append(f"📋tbl" + (f":{kv}" if kv else ""))
+            if r.get("_table_llm"):   extra_tags.append("🤖tbl-llm")
+            if r.get("_enhanced"): extra_tags.append("boost")
+            if r.get("_synonym"):  extra_tags.append("syn")
+            if r.get("_filename_kw"): extra_tags.append("fname-kw")
+            if r.get("_semantic"):    extra_tags.append("sem")
+            if r.get("_personal_boost"): extra_tags.append("👤personal")
+            if r.get("_ollama_kw_direct"):
+                extra_tags.append(f"okw:{len(r.get('_ollama_kw_direct', []))}")
+            if r.get("_kw_fallback"):
+                extra_tags.append(f"kw:{str(r['_kw_fallback'])[:10]}")
+            if r.get("_subquery"): extra_tags.append(f"sq:{r['_subquery'][:15]}")
+            if r.get("_forced"):   extra_tags.append(f"📌fname{r.get('_file_rel',0):.1f}")
+            elif r.get("_file_rel", r.get("_rel", 0)) >= 0.5:
+                extra_tags.append(f"fn={r.get('_file_rel', r.get('_rel',0)):.1f}")
+            tags_str = f" [{','.join(extra_tags)}]" if extra_tags else ""
+
+            chunks_block += (f"\n**[{i}] {src}**{kw} {conf_icon}{tags_str}\n"
+                             f"_s={score:.3f} conf={confidence:.2f} v={r.get('vector_score',0):.2f} "
+                             f"b={r.get('bm25_score',0):.2f} kw={r.get('keyword_score',0):.2f}{rel_str}_\n")
+        else:
+            chunks_block += f"\n**[{i}] {src}**{kw} {conf_icon} _(оноо: {score:.2f})_\n"
+        chunks_block += f"```\n{preview}\n```\n"
+
+    initial = exp_block + ranking_block + pattern_block + chunks_block + trace_block
+    history = _chat_append(history, question, initial)
+    yield history
+
+    if not model or model == "(олдсонгүй)": return
+
+    ctx_parts = []
+    for i, r in enumerate(results, 1):
+        src = r.get("source", "?")
+        text = r.get("text", "").strip()[:1500]
+        ctx_parts.append(f"[{i}] Source: {src}\n{text}")
+    ctx = "\n\n---\n\n".join(ctx_parts)
+
+    ollama_ans, started = "", False
+    for tok in ask_stream(model, question, ctx):
+        if not started:
+            started = True
+            history = _chat_update_last(history, initial+"\n---\n**🤖 AI хариулт:**\n")
+            yield history
+        ollama_ans += tok
+        history = _chat_update_last(history, initial+"\n---\n**🤖 AI хариулт:**\n"+ollama_ans)
+        yield history
+    if not started:
+        history = _chat_update_last(history, initial+"\n---\n_Ollama хариулаагүй._")
+        yield history
+
+
+# ── Файл оношлогоо ───────────────────────────────────────────
+def diagnose_file(filename_pat: str, test_query: str) -> str:
+    if store is None:
+        return "⚠️ Индекс ачаалагдаагүй. Эхлээд ачааллана уу."
+    pat = (filename_pat or "").strip()
+    if not pat:
+        return "⚠️ Файлын нэрийн хэсэг оруулна уу."
+
+    pat_l   = _normalize_filename(pat).lower()
+    matched = [ch for ch in store.chunks
+               if pat_l in _normalize_filename(ch.get("source","")).lower()]
+
+    lines = [f"## 🔬 Файл оношлогоо: `{pat}`\n"]
+    if not matched:
+        lines.append(f"❌ **'{pat}' нэртэй файл индексэд байхгүй.**\n")
+        lines.append("**Бүх файлын жагсаалт:**")
+        for s in sorted({ch.get("source","?") for ch in store.chunks}):
+            lines.append(f"  - `{s}`")
+        return "\n".join(lines)
+
+    srcs = sorted({ch.get("source","?") for ch in matched})
+    lines.append(f"✅ **{len(matched)} chunk** | {len(srcs)} файл:")
+    for s in srcs:
+        n = sum(1 for ch in matched if ch.get("source") == s)
+        lines.append(f"  - `{s}` ({n} chunk)")
+    lines.append(f"\n**Нийт индексэд:** {len(store.chunks):,} chunk\n")
+
+    query = (test_query or "").strip()
+    tbl_query = query or pat
+    tbl_hits = _table_first_retrieval(store, tbl_query, max_tables=5)
+    tbl_match = [c for c in tbl_hits
+                 if pat_l in _normalize_filename(c.get("source","")).lower()]
+    if tbl_match:
+        lines.append(f"**📋 Table detection:** ✅ `{tbl_match[0].get('source','')}` | "
+                     f"score={tbl_match[0]['score']:.2f} | "
+                     f"kv=`{tbl_match[0].get('_table_kv','')[:50]}`\n")
+    else:
+        lines.append(f"**📋 Table detection:** ❌ '{pat}' файл table scan-д олдсонгүй\n")
+
+    if not query:
+        lines.append("💡 **Test query оруулбал оноо харагдана.**")
+        lines.append("\n**Chunk preview (эхний 5):**")
+        for i, ch in enumerate(matched[:5], 1):
+            p = ch["text"][:150].replace("\n"," ")
+            lines.append(f"\n**[{i}]** `{ch.get('source','?')}`\n```\n{p}…\n```")
+        return "\n".join(lines)
+
+    qe = store.engine.encode([query], is_query=True)
+    vs, vi = store.faiss_idx.search(qe, min(len(store.chunks), 300))
+    vmx = max(float(vs[0][0]), 1e-9)
+    vec_map = {int(i): float(s)/vmx for s,i in zip(vs[0],vi[0]) if i >= 0}
+    ch2i = {id(ch): i for i, ch in enumerate(store.chunks)}
+
+    bm25_map: dict = {}
+    for bq in _build_bm25_queries(query, expand_query(query)):
+        for idx, sc in store.bm25.search(bq, top_k=len(store.chunks)):
+            bm25_map[idx] = max(bm25_map.get(idx, 0.0), sc)
+    bm25_mx = max(bm25_map.values(), default=1e-9)
+
+    w = WEIGHT_PROFILES.get(classify_query_type(query), WEIGHT_PROFILES["mixed"])
+    lines.append(f"**Query:** `{query}` | type=`{classify_query_type(query)}` | "
+                 f"bm25={w['bm25']:.2f} vec={w['vector']:.2f} kw={w['keyword']:.2f}\n")
+    lines.append("```")
+    lines.append(f"{'#':<3} {'Vec':>6} {'BM25':>6} {'KW':>6} {'Score':>7}  Preview")
+    lines.append("─"*72)
+
+    scored = []
+    for ch in matched:
+        idx = ch2i.get(id(ch), -1)
+        v  = vec_map.get(idx, 0.0)
+        b  = bm25_map.get(idx, 0.0) / bm25_mx
+        tl = ch["text"].lower()
+        ql = query.lower()
+        ws = [x for x in re.findall(r'\w+', ql, re.UNICODE) if len(x) > 2]
+        kw = 1.0 if ql in tl else (sum(1 for x in ws if x in tl)/len(ws) if ws else 0.0)
+        sc = w["vector"]*v + w["bm25"]*b + w["keyword"]*kw
+        scored.append((sc, v, b, kw, ch))
+
+    scored.sort(reverse=True)
+    for i, (sc, v, b, kw, ch) in enumerate(scored[:8], 1):
+        prev = ch["text"][:55].replace("\n"," ")
+        lines.append(f"{i:<3} {v:>6.3f} {b:>6.3f} {kw:>6.3f} {sc:>7.3f}  {prev}…")
+    lines.append("```")
+
+    if scored:
+        all_fs = _score_all_files(store, query, expand_query(query))
+        rank   = next((i for i,(src,*_) in enumerate(all_fs,1)
+                       if pat_l in _normalize_filename(src).lower()), None)
+        lines.append(f"\n**Бүх файл дунд rank:** "
+                     f"{'**#'+str(rank)+'**' if rank else '?'} | "
+                     f"best chunk score={scored[0][0]:.3f}")
+        if rank and rank > 3:
+            lines.append("⚠️ Rank доогуур — query өөрчилж үзнэ үү.")
+        elif rank and rank <= 3:
+            lines.append("✅ Rank өндөр — зөв ажиллаж байна.")
+    return "\n".join(lines)
+
+
+def run_diagnose(pat, query):
+    return diagnose_file(pat, query)
+
+
+# ── UI ───────────────────────────────────────────────────────
+CSS = ("body{font-family:'Segoe UI',sans-serif}"
+       ".title-box{background:linear-gradient(135deg,#0f0c29,#302b63,#24243e);"
+       "color:#fff;padding:20px;border-radius:12px;margin-bottom:10px}"
+       ".idx-box{background:#f0f4ff;border:1px solid #c0cfe8;border-radius:10px;padding:10px}"
+       "footer{display:none!important}")
+
+def _mchoices():
+    a = _check_available()
+    ml   = [k for k in ["multilingual-fast","multilingual-quality"] if a.get(k)]
+    rest = [k for k,v in a.items() if v and k not in ml]
+    return (ml+rest) or [DEFAULT_EMBED]
+
+_init_ollama   = get_ollama_models()
+_saved_indexes = list_saved_indexes()
+_avail         = _check_available()
+
+with gr.Blocks(title="Офлайн AI — Hybrid RAG", css=CSS) as demo:
+    gr.HTML(
+        '<div class="title-box">'
+        '<h1 style="margin:0;font-size:1.7em">🧠 Офлайн AI Мэдлэгийн Сан</h1>'
+        '<p style="margin:4px 0 0;opacity:.75">Vector + BM25 + Keyword | ONNX | 100% офлайн</p>'
+        f'<p style="margin:3px 0 0;opacity:.5;font-size:.85em">'
+        f'BM25={BM25_WEIGHT} Vector={VECTOR_WEIGHT} | embed={EMBED_MAX_LEN} | {_gpu_str()}</p>'
+        '</div>'
+    )
+
+    if not any(_avail.values()):
+        gr.HTML('<div style="background:#fff3cd;border:2px solid #ffc107;padding:14px;border-radius:10px">'
+                '<b>⚠️ Model татагдаагүй!</b><br><code>python App.py --download</code></div>')
+    elif not any(_avail.get(k) for k in ["multilingual-fast","multilingual-quality"]):
+        gr.HTML('<div style="background:#e3f0ff;border:2px solid #4a90d9;padding:12px;border-radius:10px">'
+                '<b>💡 Монгол хэлийн загвар татаагүй</b><br><code>python App.py --download</code></div>')
+
+    with gr.Row():
+        with gr.Column(scale=1, min_width=320):
+            with gr.Group():
+                gr.Markdown("### 📁 Шинэ индекс")
+                folder_input    = gr.Textbox(label="Фолдер зам", placeholder=r"C:\Docs", lines=1)
+                save_name_input = gr.Textbox(label="Нэр", placeholder="хоосон → фолдерын нэр", lines=1)
+                mc        = _mchoices()
+                emb_model = gr.Radio(choices=mc, value=mc[0], label="Embedding загвар",
+                                     info="🌐 = Монгол дэмжинэ")
+                index_btn    = gr.Button("🔍 Индексэлж хадгалах", variant="primary")
+                index_status = gr.Markdown("*Фолдер сонгоогүй*")
+
+            gr.Markdown("---")
+
+            with gr.Group(elem_classes="idx-box"):
+                gr.Markdown("### 💾 Хадгалагдсан индексүүд")
+                with gr.Row():
+                    saved_dd = gr.Dropdown(
+                        choices=_saved_indexes or ["(байхгүй)"],
+                        value=_saved_indexes[0] if _saved_indexes else "(байхгүй)",
+                        label="Индекс", interactive=True, scale=4)
+                    refresh_idx_btn = gr.Button("🔄", scale=1, min_width=50)
+                index_info_md = gr.Markdown(_index_info(_saved_indexes[0]) if _saved_indexes else "")
+                with gr.Row():
+                    load_btn   = gr.Button("📂 Ачааллах", variant="primary", scale=2)
+                    delete_btn = gr.Button("🗑️ Устгах", variant="stop", scale=1)
+
+            gr.Markdown("---")
+            gr.Markdown("### 🤖 Ollama")
+            with gr.Row():
+                model_dd    = gr.Dropdown(
+                    choices=_init_ollama or ["(олдсонгүй)"],
+                    value=_init_ollama[0] if _init_ollama else "(олдсонгүй)",
+                    label="Загвар", interactive=True, scale=3)
+                refresh_btn = gr.Button("🔄", scale=1, min_width=50)
+
+            top_k        = gr.Slider(1, 10, value=DEFAULT_TOP_K, step=1, label="Top-K")
+            use_reranker = gr.Checkbox(value=True, label="Reranker", info="Англи асуултад")
+            debug_mode   = gr.Checkbox(value=False, label="🔍 Debug", info="Оноо харуулна")
+
+            gr.Markdown(f"---\n**Заавар:**\n"
+                        f"1. `pip install pymupdf pypdf pdfplumber rank-bm25`\n\n"
+                        f"2. `python App.py --download`\n\n"
+                        f"3. `ollama serve`\n\n"
+                        f"4. `python App.py`\n\n"
+                        f"**⚡ Intel GPU хурдасгал:**\n"
+                        f"`pip install optimum[openvino] onnxruntime-openvino`\n\n"
+                        f"📁 `{INDEX_DIR}`")
+
+        with gr.Column(scale=2):
+            with gr.Tabs():
+                with gr.Tab("💬 Асуулт"):
+                    chatbot = _make_chatbot()
+                    with gr.Row():
+                        question_input = gr.Textbox(
+                            label="Асуулт", lines=2, scale=5, interactive=True,
+                            placeholder="Монгол болон Англи хэлээр…")
+                        send_btn = gr.Button("📨", variant="primary", scale=1)
+                    clear_btn = gr.Button("🗑️ Цэвэрлэх", size="sm")
+
+                with gr.Tab("🔬 Файл шалгах"):
+                    gr.Markdown(
+                        "Файл индексэд байгаа эсэх, query-д хэдэн оноо авч байгаа, "
+                        "table detection ажиллаж байгааг шалгана."
+                    )
+                    diag_pat   = gr.Textbox(
+                        label="Файлын нэрийн хэсэг",
+                        placeholder="жнь: тайлан  эсвэл  дүн  эсвэл  .pdf",
+                        lines=1)
+                    diag_query = gr.Textbox(
+                        label="Test query (заавал биш)",
+                        placeholder="жнь: энэ баримтад юу байна  /  what does this file contain",
+                        lines=1)
+                    diag_btn = gr.Button("🔍 Шалгах", variant="primary")
+                    diag_out = gr.Markdown("")
+                    diag_btn.click(run_diagnose, [diag_pat, diag_query], [diag_out])
+
+    index_btn.click(index_folder, [folder_input,emb_model,save_name_input], [index_status,saved_dd,index_info_md])
+    load_btn.click(load_index, [saved_dd], [index_status,saved_dd,index_info_md])
+    delete_btn.click(delete_index, [saved_dd], [index_status,saved_dd,index_info_md])
+    refresh_idx_btn.click(refresh_indexes, outputs=[saved_dd,index_info_md])
+    saved_dd.change(show_index_info, [saved_dd], [index_info_md])
+    refresh_btn.click(refresh_models, outputs=[model_dd])
+    send_btn.click(answer_stream, [question_input,model_dd,top_k,use_reranker,debug_mode,chatbot], [chatbot])
+    question_input.submit(answer_stream, [question_input,model_dd,top_k,use_reranker,debug_mode,chatbot], [chatbot])
+    clear_btn.click(lambda: [], outputs=[chatbot])
+
+
+# ── Main ─────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import multiprocessing; multiprocessing.freeze_support()
+
+    if "--download" in sys.argv:
+        print("="*50 + "\n📥 MODEL ТАТАХ\n" + "="*50)
+        download_all(); sys.exit(0)
+
+    if "--clear-cache" in sys.argv:
+        print("="*50 + "\n🗑️ КЭШ ЦЭВЭРЛЭХ\n" + "="*50)
+        import shutil as _sh
+        for sub in ["embeddings", "trackers", "chunk_stores"]:
+            p = CACHE_DIR / sub
+            if p.exists():
+                _sh.rmtree(p)
+                print(f"  🗑️ {p}")
+        print("✅ Кэш цэвэрлэгдлээ. Дахин индексэлнэ үү.")
+        sys.exit(0)
+
+    cores, ram = _cpu_info()
+    avail = _check_available()
+    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("="*50)
+    print("🚀 Офлайн AI — Hybrid RAG (v2 — speed+fix+pdf-debug)")
+    print("="*50)
+    print(f"  CPU: {cores} core | RAM: {ram:.1f}GB | {_gpu_str()}")
+    print(f"  Batch: {_opt_batch()} | Threads: {_opt_threads()}")
+    print(f"  BM25={BM25_WEIGHT} Vector={VECTOR_WEIGHT} | embed={EMBED_MAX_LEN}")
+
+    # PDF library status
+    print("\n  📄 PDF уншигч статус:")
+    try:
+        import fitz
+        print(f"     ✅ PyMuPDF {fitz.version[0]} — Stage 1 (хамгийн сайн)")
+    except ImportError:
+        print("     ❌ PyMuPDF байхгүй → pip install pymupdf")
+    try:
+        import pdfplumber
+        print(f"     ✅ pdfplumber — Stage 2 (CJK/Japanese)")
+    except ImportError:
+        print("     ⚠️  pdfplumber байхгүй → pip install pdfplumber  (CJK PDF-д хэрэгтэй)")
+    try:
+        from pypdf import PdfReader
+        print(f"     ✅ pypdf — Stage 3 (fallback)")
+    except ImportError:
+        print("     ❌ pypdf байхгүй → pip install pypdf")
+
+    saved = list_saved_indexes()
+    if saved:
+        print(f"\n  Индексүүд ({len(saved)}):")
+        for n in saved[:5]: print(f"    • {n}  {_index_info(n)}")
+        last = saved[0]; print(f"\n  ⚡ Автомат ачаалал: {last}")
+        try:
+            store = HybridStore()
+            if store.load(_index_base(last)):
+                ml = "🌐" if store.engine.info.get("multilingual") else "🔤"
+                print(f"  ✅ {last} ({len(store.chunks):,} chunk) {ml}")
+            else: store = None
+        except Exception as e: print(f"  ⚠️  {e}"); store = None
+    else:
+        print("\n  ℹ️  Индекс байхгүй")
+
+    print("\n  Embedding загварууд:")
+    for k, ex in avail.items():
+        tag = ("onnx_q8" if (_embed_onnx_path(k)/"model_q8.onnx").exists()
+               else "onnx" if _embed_onnx_path(k).exists()
+               else "pytorch" if ex else "---")
+        ml  = " 🌐" if EMBED_MODELS[k].get("multilingual") else ""
+        rec = " ← default" if k==DEFAULT_EMBED and ex else ""
+        print(f"    {'✅' if ex else '❌'} {k}{ml}: {EMBED_MODELS[k]['desc']} [{tag}]{rec}")
+
+    print(f"\n  Reranker: {'✅' if _reranker_path().exists() else '❌ (--download)'}")
+    try: from rank_bm25 import BM25Okapi; print("  BM25: ✅ rank-bm25")
+    except ImportError: print("  BM25: ⚠️ TF-IDF (pip install rank-bm25)")
+    exe = _find_ollama()
+    print(f"\n  Ollama: {'✅' if exe else '❌'}")
+    if _init_ollama: print(f"    Загвар: {', '.join(_init_ollama)}")
+    if not any(avail.get(k) for k in ["multilingual-fast","multilingual-quality"]):
+        print("\n  💡 python App.py --download")
+    print(f"\n  📌 http://localhost:7860\n{'='*50}")
+    demo.launch(server_name="127.0.0.1", server_port=7860, share=False, inbrowser=True)

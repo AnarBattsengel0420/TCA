@@ -1,0 +1,10 @@
+*.bak
+*.bak_*
+App_backup2.py
+App_backup.py
+diagnose_catch.py
+embedding_check.py
+improve_ollama.py
+patch_direct.py
+profile_speed.py
+python speed_check.py

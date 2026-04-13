@@ -1,0 +1,20 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build Thesis PDF (XeLaTeX)",
+			"type": "shell",
+			"command": "latexmk",
+			"options": {
+				"cwd": "${workspaceFolder}/thesis"
+			},
+			"args": [
+				"-xelatex",
+				"-interaction=nonstopmode",
+				"-f",
+				"main.tex"
+			],
+			"group": "build"
+		}
+	]
+}
