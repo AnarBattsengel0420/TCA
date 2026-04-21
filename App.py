@@ -19,11 +19,11 @@ CACHE_DIR        = Path.home() / ".rag_cache"
 LOCAL_MODEL_DIR  = CACHE_DIR / "local_models"
 INDEX_DIR        = CACHE_DIR / "indexes"
 
-CHUNK_SIZE       = 900
-CHUNK_OVERLAP    = 50
+CHUNK_SIZE       = 600
+CHUNK_OVERLAP    = 80
 MIN_CHUNK_LEN    = 10
 MAX_FILE_MB      = 50
-FILE_TIMEOUT_SEC = 8
+FILE_TIMEOUT_SEC = 30
 DEFAULT_TOP_K    = 5
 EMBED_MAX_LEN    = 256
 BM25_WEIGHT      = 0.40
@@ -317,6 +317,7 @@ def read_pdf(p):
     ✅ DEBUG: каждый алхамыг консолд харуулна
     """
     fname = _normalize_filename(Path(p).name)
+    print(f"  📖 PDF уншиж байна: {fname}")
 
     result = ""
 
@@ -338,9 +339,14 @@ def read_pdf(p):
         doc.close()
         result = clean_text("\n\n".join(pages))
         if len(result.strip()) >= 10:
+            print(f"     ✅ [Stage 1] PyMuPDF: {len(result):,} тэмдэгт, {len(pages)} хуудас")
             return result
-    except ImportError: pass
-    except Exception: pass
+        else:
+            print(f"     ⚠️  [Stage 1] PyMuPDF: хуудас уншигдсан ч текст хоосон ({len(result)} тэмдэгт) — дараагийн stage")
+    except ImportError:
+        print(f"     ❌ [Stage 1] PyMuPDF суулгаагүй → pip install pymupdf")
+    except Exception as e:
+        print(f"     ❌ [Stage 1] PyMuPDF алдаа: {e}")
 
     # ── Stage 2: pdfplumber (CJK/Japanese fallback) ─────────
     try:
@@ -354,16 +360,21 @@ def read_pdf(p):
                 except Exception: pass
         result = clean_text("\n".join(pages))
         if len(result.strip()) >= 10:
+            print(f"     ✅ [Stage 2] pdfplumber: {len(result):,} тэмдэгт, {len(pages)} хуудас")
             return result
-    except ImportError: pass
-    except Exception: pass
+        else:
+            print(f"     ⚠️  [Stage 2] pdfplumber: текст хоосон ({len(result)} тэмдэгт) — дараагийн stage")
+    except ImportError:
+        print(f"     ℹ️  [Stage 2] pdfplumber суулгаагүй (CJK PDF-д хэрэгтэй) → pip install pdfplumber")
+    except Exception as e:
+        print(f"     ❌ [Stage 2] pdfplumber алдаа: {e}")
 
     # ── Stage 3: pypdf ───────────────────────────────────────
     try:
         with open(p,"rb") as f:
             header = f.read(4)
         if header != b"%PDF":
-            pass  # print(f"     ❌ [Stage 3] Энэ файл PDF биш байна (header: {header})")
+            print(f"     ❌ [Stage 3] Энэ файл PDF биш байна (header: {header})")
             return ""
         from pypdf import PdfReader
         pages = []
@@ -374,12 +385,18 @@ def read_pdf(p):
                 t = pg.extract_text() or ""
                 if t.strip(): pages.append(t)
             except Exception as pe:
-                pass  # print(f"     ⚠️  [Stage 3] pypdf хуудас алдаа: {pe}")
+                print(f"     ⚠️  [Stage 3] pypdf хуудас алдаа: {pe}")
         result = clean_text("\n".join(pages))
         if len(result.strip()) >= 10:
+            print(f"     ✅ [Stage 3] pypdf: {len(result):,} тэмдэгт, {len(pages)}/{total_pages} хуудас")
             return result
-    except ImportError: pass
-    except Exception: pass
+        else:
+            print(f"     ⚠️  [Stage 3] pypdf: {total_pages} хуудас байгаа ч текст гарсангүй ({len(result)} тэмдэгт)")
+            print(f"         → Зурган PDF байж магадгүй (scan хийсэн). OCR хэрэгтэй.")
+    except ImportError:
+        print(f"     ❌ [Stage 3] pypdf суулгаагүй → pip install pypdf")
+    except Exception as e:
+        print(f"     ❌ [Stage 3] pypdf алдаа: {e}")
 
     # ── Stage 4: Placeholder (never silently drop) ───────────
     name_clean = _normalize_filename(Path(p).stem).replace("_"," ").replace("-"," ")
@@ -389,9 +406,16 @@ def read_pdf(p):
         n = len(doc)
         doc.close()
         if n > 0:
-            return f"[Зурган PDF] {name_clean} | {n} хуудас"
-    except Exception: pass
-    return f"[PDF уншигдсангүй] {name_clean}"
+            placeholder = f"[Зурган PDF] {name_clean} | {n} хуудас"
+            print(f"     ⚠️  [Stage 4] Placeholder буцааж байна: '{placeholder}'")
+            print(f"         → OCR ашиглахыг зөвлөж байна: pip install pytesseract")
+            return placeholder
+    except Exception:
+        pass
+
+    placeholder = f"[PDF уншигдсангүй] {name_clean}"
+    print(f"     ⚠️  [Stage 4] Бүх stage амжилтгүй. Placeholder: '{placeholder}'")
+    return placeholder
 
 def read_docx(p):
     try:
@@ -422,11 +446,7 @@ def _file_hash(p):
     h = hashlib.md5()
     try:
         with open(p,"rb") as f:
-            # Эхний 64KB + файлын хэмжээ → хурдан hash
-            data = f.read(65536)
-            h.update(data)
-            sz = f.seek(0, 2)
-            h.update(str(sz).encode())
+            for blk in iter(lambda: f.read(8192), b""): h.update(blk)
     except Exception: pass
     return h.hexdigest()
 
@@ -447,7 +467,7 @@ def _read_one(fp):
         t0 = time.perf_counter()
         txt = (READERS[ext](str(fp)) or "").strip()
         elapsed = time.perf_counter() - t0
-        if elapsed > 30.0:
+        if elapsed > 5.0:
             print(f"  ⚠️ УДААН: {fp.name} — {elapsed:.1f}с ({sz//1024}KB)")
         if not txt:
             r = "PDF: текст олдсонгүй" if ext==".pdf" else "хоосон агуулга"
@@ -514,22 +534,33 @@ def load_documents(folder, progress=None):
             filtered.append(f)
 
     if auto_skipped:
-        print(f"  🔍 Шүүлт: {len(auto_skipped)} алгасагдлаа → {len(filtered)} файл үлдсэн")
+        print(f"  🔍 Автомат шүүлт: {len(auto_skipped)} test/fixture файл алгасагдлаа")
+        if len(auto_skipped) <= 10:
+            for s in auto_skipped:
+                print(f"     • {s}")
+        else:
+            for s in auto_skipped[:5]:
+                print(f"     • {s}")
+            print(f"     ... +{len(auto_skipped)-5} файл")
+        print(f"  ✅ Үлдсэн: {len(filtered)} файл (таны бодит баримтууд)")
 
     files = filtered
 
     pdf_files = [f for f in files if f.suffix.lower() == ".pdf"]
-    print(f"  📄 PDF: {len(pdf_files)} файл | Нийт: {len(files)} файл")
+    if pdf_files:
+        print(f"\n  📄 PDF файлууд ({len(pdf_files)}) — дэлгэрэнгүй log доор харагдана:")
+        for pf in pdf_files:
+            print(f"     • {_normalize_filename(pf.name)} ({pf.stat().st_size // 1024}KB)")
+        print()
+    else:
+        print(f"  ℹ️  PDF файл олдсонгүй (фолдерт .pdf файл байгаа эсэхийг шалгана уу)")
 
     docs, skipped, done, total = [], [], 0, len(files)
-    n_workers = min(max(os.cpu_count() or 4, 16), 32, total)
-    with ThreadPoolExecutor(max_workers=n_workers) as ex:
+    with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, 8, total)) as ex:
         futs = {ex.submit(_read_one,f): f for f in files}
-        log_interval = max(total // 10, 1)
         for fut in as_completed(futs):
             f = futs[fut]; done += 1
-            if progress and done % log_interval == 0:
-                progress(done/total*0.30, desc=f"📄 {done}/{total}")
+            if progress: progress(done/total*0.30, desc=f"📄 {done}/{total} — {f.name[:35]}")
             try:
                 r = fut.result(timeout=FILE_TIMEOUT_SEC)
                 if r is None:       skipped.append(f"{f.name} — алдаа")
@@ -537,7 +568,17 @@ def load_documents(folder, progress=None):
                 else:               docs.append(r)
             except Exception as e: skipped.append(f"{f.name} — {str(e)[:50]}")
 
-    print(f"  📊 Уншилтын дүн: ✅ {len(docs)} файл уншсан | ⚠️ {len(skipped)} алгасагдсан")
+    print(f"\n  {'─'*50}")
+    print(f"  📊 Уншилтын дүн:")
+    if docs:
+        print(f"  ✅ Амжилттай уншсан: {len(docs)} файл")
+        for d in docs:
+            print(f"     • {d['name']} ({d['size']:,} тэмдэгт)")
+    if skipped:
+        print(f"  ⚠️  Алгасагдсан: {len(skipped)}")
+        for s in skipped:
+            print(f"     • {s}")
+    print(f"  {'─'*50}\n")
 
     return docs, skipped
 
@@ -566,7 +607,7 @@ def build_chunks_parallel(docs):
     if not docs: return {}
     file_chunks = {}
     try:
-        with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, len(docs), 24)) as ex:
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count() or 4, len(docs), 8)) as ex:
             for fut in as_completed({ex.submit(_chunk_doc,d): d for d in docs}):
                 try:
                     path, name, chunks = fut.result(timeout=60)
@@ -599,7 +640,7 @@ class EmbeddingCache:
                 with open(p,"rb") as f: self._store = pickle.load(f)
                 el = time.perf_counter() - t0
                 print(f"  💎 Embedding кэш: {len(self._store):,} бичлэг | {sz//1024//1024}MB | {el:.1f}с")
-                if el > 60:
+                if el > 10:
                     print(f"  ⚠️  Кэш удаан ачаалагдлаа! python App.py --clear-cache")
             except Exception:
                 self._store = {}
@@ -626,8 +667,7 @@ class EmbeddingCache:
             elif h in seen:     results[i] = ("dup", seen[h])
             else:               seen[h] = len(need_idx); need_idx.append(i); need_txt.append(texts[i])
         cached = sum(1 for r in results if r is not None and not isinstance(r,tuple))
-        if len(need_txt) > 0:
-            print(f"  кэш:{cached} шинэ:{len(need_txt)}")
+        print(f"  кэш:{cached} dedup:{sum(1 for r in results if isinstance(r,tuple))} шинэ:{len(need_txt)}")
         if need_txt:
             new = encode_fn(need_txt, progress_cb=lambda d,t,s: progress_fn(d,t,s) if progress_fn else None)
             with self._lock:
@@ -943,9 +983,22 @@ class HybridStore:
                 self.chunks.append(ch); all_texts.append(ch["text"])
         if not all_texts: return 0
 
-        n_files = len({ch.get("source","?") for ch in self.chunks})
+        src_counts = {}
+        for ch in self.chunks:
+            src = ch.get("source", "?")
+            src_counts[src] = src_counts.get(src, 0) + 1
+        n_files = len(src_counts)
         n_chunks = len(all_texts)
         print(f"  📊 {n_files} файл → {n_chunks:,} chunk")
+        for src, cnt in sorted(src_counts.items(), key=lambda x: -x[1])[:5]:
+            print(f"     • {src}: {cnt} chunk")
+        if n_files > 5:
+            print(f"     ... +{n_files-5} файл")
+
+        if n_chunks > 10000:
+            est_min = n_chunks / 150
+            print(f"\n  ⚠️  {n_chunks:,} chunk маш их байна!")
+            print(f"  ⏱️  Тооцоолсон хугацаа: ~{est_min:.0f} секунд ({est_min/60:.0f} минут)")
 
         if progress: progress(0.33, desc="BM25 индекс")
         self.bm25.build(all_texts)
@@ -2898,8 +2951,8 @@ def answer_stream(question, model, top_k, use_reranker, debug_mode, history):
         if k not in seen and len(k)>5: seen.add(k); unique.append(item)
     pattern_block = ("**🔎 Олдсон мэдээлэл:**\n"+"\n".join(unique)+"\n\n") if unique else ""
 
-    n_show = 8 if debug_mode else 5
-    plen   = 800 if debug_mode else 500
+    n_show = 5 if debug_mode else 3
+    plen   = 800 if debug_mode else 400
     chunks_block = "**📄 Олдсон хэсгүүд:**\n"
     for i, r in enumerate(results[:n_show], 1):
         src     = r.get("source","?")

@@ -1,7 +1,13 @@
-\contentsline {table}{\numberline {1}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Судалгааны ажлын төлөвлөгөө}}{1}{table.caption.6}%
-\contentsline {table}{\numberline {2}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Дэмжигдэх файлын төрлүүд ба уншигч}}{9}{table.caption.18}%
-\contentsline {table}{\numberline {3}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Embedding загварууд}}{11}{table.caption.26}%
-\contentsline {table}{\numberline {4}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces LLM загваруудын харьцуулалт}}{12}{table.caption.32}%
-\contentsline {table}{\numberline {5}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Системийн бодит гүйцэтгэлийн хэмжилт (8 core CPU, 7.7GB RAM)}}{16}{table.caption.43}%
-\contentsline {table}{\numberline {6}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Индексэлэлтийн алхам бүрийн хугацаа}}{16}{table.caption.44}%
-\contentsline {table}{\numberline {7}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Оновчлолын нөлөө}}{17}{table.caption.45}%
+\contentsline {table}{\numberline {1}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Судалгааны ажлын төлөвлөгөө}}{1}{table.caption.1}%
+\contentsline {table}{\numberline {2}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Ижил төрлийн системүүдийн харьцуулалт}}{8}{table.caption.3}%
+\contentsline {table}{\numberline {3}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Дэмжигдэх файлын төрлүүд ба уншигч}}{11}{table.caption.6}%
+\contentsline {table}{\numberline {4}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Embedding загварууд}}{14}{table.caption.7}%
+\contentsline {table}{\numberline {5}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Хайлтын горим бүрийн жинлэлт}}{16}{table.caption.8}%
+\contentsline {table}{\numberline {6}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Confidence score тооцооллын бүрэлдэхүүн}}{18}{table.caption.10}%
+\contentsline {table}{\numberline {7}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces LLM загваруудын харьцуулалт}}{20}{table.caption.11}%
+\contentsline {table}{\numberline {8}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Системийн бодит гүйцэтгэлийн хэмжилт (CPU горим, Intel OpenVINO)}}{24}{table.caption.13}%
+\contentsline {table}{\numberline {9}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces 350~MB баримтын санг индексэлэхэд зарцуулсан хугацааны задаргаа}}{24}{table.caption.14}%
+\contentsline {table}{\numberline {10}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Оновчлол тус бүрийн хэмжилтийн харьцуулалт}}{25}{table.caption.15}%
+\contentsline {table}{\numberline {11}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Хайлтын аргын нарийвчлалын харьцуулалт (50 асуулт, Top-$k$=5)}}{25}{table.caption.16}%
+\contentsline {table}{\numberline {12}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Query Expansion өргөтгөлийн өмнөх болон дараах олдсон chunk-ийн тоо}}{26}{table.caption.17}%
+\contentsline {table}{\numberline {13}{\ignorespaces \xpg@aux {}{mongolian}\ignorespaces Файлын формат тус бүрийн уншилтын үр дүн (98 файл, нийт)}}{26}{table.caption.18}%

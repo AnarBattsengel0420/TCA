@@ -1,0 +1,256 @@
+% DFD diagram snippet for thesis Figure 2 (used via \input).
+% NOTE: This file is intentionally kept as a snippet (no \documentclass) because
+% it is included from thesis/main.tex.
+\begingroup
+\resizebox{\linewidth}{!}{%
+
+% ── Colour palette ───────────────────────────────────────────────────────────
+\definecolor{purple50}{RGB}{238,237,254}
+\definecolor{purple600}{RGB}{83,74,183}
+\definecolor{purple800}{RGB}{60,52,137}
+\definecolor{teal50}{RGB}{225,245,238}
+\definecolor{teal600}{RGB}{15,110,86}
+\definecolor{teal800}{RGB}{8,80,65}
+\definecolor{amber50}{RGB}{250,238,218}
+\definecolor{amber600}{RGB}{133,79,11}
+\definecolor{amber800}{RGB}{99,56,6}
+\definecolor{gray50}{RGB}{241,239,232}
+\definecolor{gray400}{RGB}{136,135,128}
+\definecolor{gray600}{RGB}{95,94,90}
+\definecolor{storebox}{RGB}{248,246,240}
+\definecolor{storeline}{RGB}{180,178,169}
+
+% ── Node styles ──────────────────────────────────────────────────────────────
+\tikzset{
+  base/.style args={#1}{
+    rectangle, rounded corners=6pt,
+    text width=#1, align=center,
+    inner sep=7pt, minimum height=28pt,
+    line width=0.4pt
+  },
+  idx/.style={base=#1,
+    fill=purple50, draw=purple600,
+    text=purple800, font=\sffamily\small\bfseries},
+  idx/.default=52mm,
+  qry/.style={base=#1,
+    fill=teal50, draw=teal600,
+    text=teal800, font=\sffamily\small\bfseries},
+  qry/.default=52mm,
+  ret/.style={base=#1,
+    fill=amber50, draw=amber600,
+    text=amber800, font=\sffamily\small\bfseries},
+  ret/.default=52mm,
+  gen/.style={base=#1,
+    fill=gray50, draw=gray400,
+    text=gray600, font=\sffamily\small\bfseries},
+  gen/.default=52mm,
+  store/.style={
+    rectangle, rounded corners=3pt,
+    fill=storebox, draw=storeline,
+    text=gray600, font=\sffamily\footnotesize,
+    inner sep=5pt, minimum height=20pt,
+    line width=0.4pt
+  },
+  aux/.style={base=#1,
+    fill=amber50, draw=amber600,
+    text=amber800, font=\sffamily\small\bfseries,
+    dashed, line width=0.7pt},
+  aux/.default=36mm,
+  sub/.style={font=\fontsize{7.5}{9}\selectfont\sffamily, text=gray600},
+  fwd/.style={-{Stealth[length=5pt]}, gray600, line width=0.7pt},
+  dsh/.style={fwd, dashed},
+  faissarr/.style={-{Stealth[length=5pt]}, teal600, line width=0.7pt},
+  bm25arr/.style={-{Stealth[length=5pt]}, purple600, line width=0.7pt},
+  scorearr/.style={-{Stealth[length=5pt]}, amber600, line width=0.7pt},
+}
+
+\begin{tikzpicture}[node distance=4.2mm and 6mm, xscale=0.66, yscale=0.80, transform shape]
+
+% ═════════════════════════════════════════════════════════════════════════════
+% PHASE 1 – INDEXING
+% ═════════════════════════════════════════════════════════════════════════════
+
+\node[gen=48mm] (folder) {Фолдерын зам};
+
+\node[idx=62mm, below=6mm of folder] (loaddoc)
+  {\textbf{load\_documents()}};
+\node[sub, below=-1mm of loaddoc.south] (loaddoc_sub)
+  {файл шүүлт · normalize · \_read\_one/read\_pdf · параллель};
+
+\node[idx=62mm, below=9mm of loaddoc_sub] (chunk)
+  {\textbf{chunk\_text()}};
+\node[sub, below=-1mm of chunk.south] (chunk_sub)
+  {600 тэмдэгт · 80 overlap · \{text, source, path\}};
+
+\node[idx=70mm, below=9mm of chunk_sub] (embed)
+  {\textbf{EmbeddingCache · EmbedEngine}};
+\node[sub, below=-1mm of embed.south] (embed_sub)
+  {ONNX INT8 · OpenVINO · MD5 кэш};
+
+\node[store, right=12mm of embed] (pkl) {emb\_v9.pkl};
+
+\node[idx=44mm, below=14mm of embed_sub, xshift=-24mm] (faiss)
+  {\textbf{FAISS индекс}};
+\node[sub, below=-1mm of faiss.south] (faiss_sub)
+  {IndexFlatIP (<= 5000) · IndexIVFFlat (> 5000)};
+
+\node[idx=44mm, right=10mm of faiss] (bm25)
+  {\textbf{BM25 индекс}};
+\node[sub, below=-1mm of bm25.south] (bm25_sub)
+  {BM25Okapi · TF-IDF fallback};
+
+\node[store, below=9mm of faiss_sub, xshift=-2mm] (disk)
+  {\{нэр\}.faiss · \{нэр\}.meta};
+
+\node[sub, below=9mm of bm25_sub, xshift=2mm, align=center] (bm25note)
+  {BM25 нь тусдаа файлд хадгалахгүй\\load() дээр .meta texts-оос rebuild};
+
+% ═════════════════════════════════════════════════════════════════════════════
+% PHASE 2 – QUERY / RETRIEVAL / GENERATION
+% ═════════════════════════════════════════════════════════════════════════════
+
+\node[gen=44mm] (query) at ($(disk)!0.5!(bm25note)+(0,-20mm)$)
+  {Хэрэглэгчийн асуулт};
+
+\node[qry=64mm, below=7mm of query] (classify)
+  {\textbf{classify\_query\_type() · expand\_query()}};
+\node[sub, below=-1mm of classify.south] (classify_sub)
+  {горим -> жин (wV,wB,wK) · expansions[ ]};
+
+\node[aux=36mm, right=10mm of classify, yshift=-6mm] (llmenh)
+  {\textbf{LLM enhance}};
+\node[sub, below=-0.5mm of llmenh.south, align=center] (llmenh_sub)
+  {rewritten\_query\\keywords[ ]\\intent};
+
+\node[ret=38mm, below=26mm of classify_sub, xshift=-52mm] (vsearch)
+  {\textbf{Вектор хайлт}};
+\node[sub, below=-1mm of vsearch.south] (vsearch_sub)
+  {FAISS cosine · vh[ ]};
+
+\node[ret=38mm, right=7mm of vsearch] (bsearch)
+  {\textbf{BM25 хайлт}};
+\node[sub, below=-1mm of bsearch.south] (bsearch_sub)
+  {query + exp[ ] · bh[ ]};
+
+\node[aux=40mm, right=7mm of bsearch] (ksearch)
+  {\textbf{Keyword fallback}};
+\node[sub, below=-1mm of ksearch.south] (ksearch_sub)
+  {\_keyword\_search() · нэмэлт candidate};
+
+\node[ret=84mm, below=12mm of bsearch_sub] (fusion)
+  {\textbf{Score fusion}};
+\node[sub, below=-1mm of fusion.south] (fusion_sub)
+  {wV*vh + wB*bh + wK*kw + file\_rel -> all\_results[ ]};
+
+\node[aux=46mm, right=8mm of fusion, yshift=-4mm] (extrasearch)
+  {\textbf{LLM нэмэлт хайлт}};
+\node[sub, below=-0.5mm of extrasearch.south, align=center] (extrasearch_sub)
+  {keywords -> BM25\\rewritten -> FAISS x0.85};
+
+\node[ret=38mm, below=12mm of fusion_sub, xshift=-22mm] (reranker)
+  {\textbf{Reranker}};
+\node[sub, below=-1mm of reranker.south] (reranker_sub)
+  {Cross-Encoder · ASCII>0.7 үед};
+
+\node[ret=56mm, right=8mm of reranker] (conf)
+  {\textbf{calculate\_confidence\_score()}};
+\node[sub, below=-1mm of conf.south] (conf_sub)
+  {confidence нь UI signal · босго 0.65};
+
+\node[qry=84mm, below=12mm of reranker_sub, xshift=22mm] (ollama)
+  {\textbf{Ollama LLM — Qwen2.5}};
+\node[sub, below=-1mm of ollama.south] (ollama_sub)
+  {context + prompt -> streaming хариулт};
+
+\node[gen=60mm, below=10mm of ollama_sub] (gradio)
+  {Gradio UI гаралт};
+
+% ═════════════════════════════════════════════════════════════════════════════
+% ARROWS
+% ═════════════════════════════════════════════════════════════════════════════
+
+\draw[fwd] (folder)  -- (loaddoc);
+\draw[fwd] (loaddoc) -- (chunk);
+\draw[fwd] (chunk)   -- (embed);
+
+\draw[fwd] (embed.east) -- node[near start, sub, above]{кэш бичих} (pkl.west);
+\draw[fwd] (pkl.south) -- ++(0,-4mm) -| node[near start, sub, right]{кэш унших} (embed.east);
+
+\draw[fwd] (embed.south) -- ++(0,-5mm) -| node[near start, sub, left]{vectors[ ]} (faiss.north);
+\draw[fwd] (embed.south) -- ++(0,-5mm) -| node[near start, sub, right]{tokens[ ]} (bm25.north);
+
+\draw[fwd] (faiss) -- (disk.north|-faiss);
+\draw[bm25arr, dashed] (bm25.south) -- (bm25note.north);
+
+\draw[faissarr] (faiss.south) -- ++(0,-7mm) -| node[near start, sub, left]{vh[ ]} (vsearch.north);
+\draw[bm25arr] (bm25.south) -- ++(10mm,-7mm) |- node[near start, sub, right]{bh[ ]} (bsearch.east);
+
+\draw[fwd] (query) -- (classify);
+\draw[dsh] (classify.east) -- (llmenh.west);
+
+\draw[fwd] (classify.south) -- ++(0,-5mm) -| node[near start, sub, left]{encode(q)} (vsearch.north);
+\draw[fwd] (classify.south) -- ++(0,-8mm) -| node[near start, sub, right]{q+exp[ ]} (bsearch.north);
+\draw[dsh] (classify.south) -- ++(0,-11mm) -| node[near start, sub, right]{fallback term} (ksearch.north);
+
+\draw[dsh] (llmenh.south) |- (extrasearch.north);
+
+\draw[scorearr] (vsearch.south) |- (fusion.west);
+\draw[scorearr] (bsearch.south) -- (bsearch.south|-fusion.north) -- (fusion.north);
+\draw[dsh] (ksearch.south) |- (fusion.east);
+
+\draw[dsh] (extrasearch.west) -- (fusion.east);
+\draw[dsh] (extrasearch.south) |- node[near start, sub, right]{нэмэлт candidate} (fusion_sub.east);
+
+\draw[scorearr] (fusion.south) -- ++(0,-6mm) -| node[near start, sub, left]{top candidates} (reranker.north);
+\draw[dsh] (fusion.south) -- ++(0,-10mm) -| node[near start, sub, right]{reranker off} (conf.north);
+
+\draw[scorearr] (reranker.east) -- node[midway, sub, above]{reranked} (conf.west);
+
+\draw[scorearr] (conf.south) -- ++(0,-5mm) -| node[near end, sub, right]{top-K chunk[ ]} (ollama.north);
+\draw[fwd] (ollama.south) -- (gradio.north);
+
+% ═════════════════════════════════════════════════════════════════════════════
+% BACKGROUND CONTAINERS
+% ═════════════════════════════════════════════════════════════════════════════
+
+\begin{pgfonlayer}{background}
+
+\node[fit=(folder)(loaddoc)(chunk)(embed)(faiss)(bm25)(disk)(bm25note)(pkl),
+  draw=purple600, fill=purple50, fill opacity=0.15,
+  rounded corners=8pt, inner sep=8pt,
+  label={[font=\footnotesize\bfseries\sffamily, text=purple800]above left:1. Индексжүүлэх үе шат}
+] (idx_bg) {};
+
+\node[fit=(query)(classify)(llmenh)(llmenh_sub),
+  draw=teal600, fill=teal50, fill opacity=0.15,
+  rounded corners=8pt, inner sep=8pt,
+  label={[font=\footnotesize\bfseries\sffamily, text=teal800]above right:2. Хайлтын үе шат}
+] (qry_bg) {};
+
+\node[fit=(vsearch)(bsearch)(ksearch)(fusion)(extrasearch)(reranker)(conf),
+  draw=amber600, fill=amber50, fill opacity=0.12,
+  rounded corners=8pt, inner sep=8pt,
+  label={[font=\footnotesize\bfseries\sffamily, text=amber800]above left:Холимог хайлт}
+] (ret_bg) {};
+
+\end{pgfonlayer}
+
+% ═════════════════════════════════════════════════════════════════════════════
+% LEGEND
+% ═════════════════════════════════════════════════════════════════════════════
+
+\node[below=10mm of gradio, align=left, text width=120mm,
+      font=\fontsize{7.5}{9}\selectfont\sffamily, text=gray600] (legend) {
+  \textcolor{purple600}{\rule{0.9em}{0.9em}}~Индексжүүлэлтийн боловсруулалт\quad
+  \textcolor{storeline}{\rule{0.9em}{0.9em}}~Индекс (санах ой/диск)\quad
+  \textcolor{amber600}{\rule{0.9em}{0.9em}}~Хайлт ба оноо\quad
+  \textcolor{teal600}{\rule{0.9em}{0.9em}}~Query ба LLM\\
+  \textcolor{gray600}{---}~Нөхцөлт/нэмэлт урсгал,
+  \textcolor{teal600}{->}~FAISS,
+  \textcolor{purple600}{->}~BM25,
+  \textcolor{amber600}{->}~Оноо урсгал
+};
+
+\end{tikzpicture}
+}%
+\endgroup

@@ -1,0 +1,203 @@
+% ===================================================================
+% DIAGRAM 1: Query Classification & Weight Selection Flow
+% Use in §4.2 - Query Analysis Section
+% ===================================================================
+\begin{tikzpicture}[node distance=2.5cm, auto]
+  % Define styles
+  \tikzstyle{input} = [rectangle, draw, rounded corners, fill=blue!20, 
+                       minimum width=2.5cm, minimum height=0.8cm, thick]
+  \tikzstyle{decision} = [diamond, draw, fill=yellow!30, 
+                          minimum width=2cm, thick]
+  \tikzstyle{process} = [rectangle, draw, rounded corners, fill=blue!15, 
+                         minimum width=2.2cm, minimum height=0.7cm, thick]
+  \tikzstyle{output} = [rectangle, draw, rounded corners, fill=green!20, 
+                        minimum width=2.5cm, minimum height=0.8cm, thick]
+  
+  % Nodes
+  \node [input] (input) {Хэрэглэгчийн асуулга};
+  
+  \node [decision, below of=input] (classify) {Асуултын төрөл\nний сонголт};
+  
+  % Four classification branches
+  \node [process, below of=classify, xshift=-4.5cm] (factual) 
+    {Баримтын асуулга};
+  \node [process, below of=classify, xshift=-1.5cm] (semantic) 
+    {Утгын асуулга};
+  \node [process, below of=classify, xshift=1.5cm] (exact) 
+    {Яг таарах асуулга};
+  \node [process, below of=classify, xshift=4.5cm] (mixed) 
+    {Холимог асуулга};
+  
+  % Weight assignments
+  \node [fill=blue!10, rounded corners, text width=3.2cm, 
+         below of=factual, yshift=-0.5cm, minimum height=1.2cm] (wf) 
+    {BM25: 0.40\\Vector: 0.35\\Keyword: 0.25};
+  
+  \node [fill=blue!10, rounded corners, text width=3.2cm, 
+         below of=semantic, yshift=-0.5cm, minimum height=1.2cm] (ws) 
+    {BM25: 0.20\\Vector: 0.55\\Keyword: 0.25};
+  
+  \node [fill=blue!10, rounded corners, text width=3.2cm, 
+         below of=exact, yshift=-0.5cm, minimum height=1.2cm] (we) 
+    {BM25: 0.20\\Vector: 0.10\\Keyword: 0.70};
+  
+  \node [fill=blue!10, rounded corners, text width=3.2cm, 
+         below of=mixed, yshift=-0.5cm, minimum height=1.2cm] (wm) 
+    {BM25: 0.30\\Vector: 0.40\\Keyword: 0.30};
+  
+  % Final output
+  \node [output, below of=classify, yshift=-5.5cm] (output) 
+    {Жин коэффициентүүд};
+  
+  % Edges
+  \draw [->] (input) -- (classify);
+  
+  \draw [->] (classify) -- node[above, font=\small] {Баримт} (factual);
+  \draw [->] (classify) -- node[above, font=\small] {Утга} (semantic);
+  \draw [->] (classify) -- node[above, font=\small] {Яг} (exact);
+  \draw [->] (classify) -- node[above, font=\small] {Холимог} (mixed);
+  
+  \draw [->] (factual) -- (wf);
+  \draw [->] (semantic) -- (ws);
+  \draw [->] (exact) -- (we);
+  \draw [->] (mixed) -- (wm);
+  
+  \draw [->] (wf) -- (output);
+  \draw [->] (ws) -- (output);
+  \draw [->] (we) -- (output);
+  \draw [->] (wm) -- (output);
+  
+\end{tikzpicture}
+
+% ===================================================================
+% DIAGRAM 2: Hybrid Search Score Fusion Pipeline
+% Use in §4.3 - Search and Retrieval Section
+% ===================================================================
+\begin{tikzpicture}[node distance=2.2cm, auto]
+  % Styles
+  \tikzstyle{search_box} = [rectangle, draw, rounded corners, fill=cyan!20, 
+                            minimum width=2cm, minimum height=0.8cm, thick]
+  \tikzstyle{process_box} = [rectangle, draw, rounded corners, fill=blue!15, 
+                             minimum width=2.1cm, minimum height=0.7cm, thick]
+  \tikzstyle{fusion_box} = [rectangle, draw, rounded corners, fill=purple!15, 
+                            minimum width=2.3cm, minimum height=0.8cm, thick]
+  \tikzstyle{filter_box} = [diamond, draw, fill=yellow!25, thick]
+  \tikzstyle{output_box} = [rectangle, draw, rounded corners, fill=green!20, 
+                            minimum width=2.5cm, minimum height=0.8cm, thick]
+  
+  % Search query input
+  \node [rectangle, draw, rounded corners, fill=blue!20, 
+         minimum width=2.5cm, minimum height=0.8cm, thick] (query) 
+    {Дараахын асуулга};
+  
+  % Three parallel search branches
+  \node [search_box, below of=query, xshift=-3.5cm] (vector) 
+    {FAISS Vector};
+  \node [search_box, below of=query, xshift=0cm] (bm25) 
+    {BM25 Статик};
+  \node [search_box, below of=query, xshift=3.5cm] (keyword) 
+    {Түлхүүр үг};
+  
+  % Score outputs
+  \node [process_box, below of=vector] (sv) 
+    {Векторын скор};
+  \node [process_box, below of=bm25] (sb) 
+    {BM25 скор};
+  \node [process_box, below of=keyword] (sk) 
+    {Түлхүүрийн скор};
+  
+  % Fusion formula
+  \node [fusion_box, below of=bm25, yshift=-2.2cm] (fusion) 
+    {Жин нэмэх:\\$w_v \cdot s_v + w_b \cdot s_b + w_k \cdot s_k$};
+  
+  % Confidence threshold
+  \node [filter_box, below of=fusion] (threshold) 
+    {Итгэл > 0.65?};
+  
+  % Output
+  \node [output_box, below of=threshold, yshift=-1.2cm] (results) 
+    {Эрэмбэлэгдсэн үр дүн};
+  
+  % Rejected path
+  \node [process_box, below of=threshold, xshift=-2.5cm] (reject) 
+    {Хаях};
+  
+  % Connections
+  \draw [->] (query) -- (vector);
+  \draw [->] (query) -- (bm25);
+  \draw [->] (query) -- (keyword);
+  
+  \draw [->] (vector) -- (sv);
+  \draw [->] (bm25) -- (sb);
+  \draw [->] (keyword) -- (sk);
+  
+  \draw [->] (sv) -- (fusion);
+  \draw [->] (sb) -- (fusion);
+  \draw [->] (sk) -- (fusion);
+  
+  \draw [->] (fusion) -- (threshold);
+  
+  \draw [->] (threshold) -- node[right, font=\small] {Тийм} (results);
+  \draw [->] (threshold) -- node[left, font=\small] {Үгүй} (reject);
+  
+\end{tikzpicture}
+
+% ===================================================================
+% DIAGRAM 3: Confidence Score Breakdown & Reranking
+% Use in §4.4 - Results Ranking Section
+% ===================================================================
+\begin{tikzpicture}[node distance=2cm, auto]
+  % Styles
+  \tikzstyle{base_box} = [rectangle, draw, rounded corners, fill=blue!20, 
+                          minimum width=2.5cm, minimum height=0.8cm, thick]
+  \tikzstyle{bonus_box} = [rectangle, draw, rounded corners, fill=orange!20, 
+                           minimum width=2.4cm, minimum height=0.65cm, thick]
+  \tikzstyle{sum_box} = [rectangle, draw, rounded corners, fill=purple!20, 
+                         minimum width=2.5cm, minimum height=0.8cm, thick]
+  \tikzstyle{final_box} = [rectangle, draw, rounded corners, fill=green!25, 
+                           minimum width=2.6cm, minimum height=0.85cm, thick]
+  
+  % Base score
+  \node [base_box] (base) {Үндсэн скор\\(Fusion үр дүн)};
+  
+  % Bonus factors arranged in 2 columns
+  \node [bonus_box, below of=base, xshift=-3.5cm] (bonus1) 
+    {Олон арга нийцэл\\+0.15};
+  
+  \node [bonus_box, below of=base, xshift=-1.2cm] (bonus2) 
+    {Reranker баталгаа\\+0.10};
+  
+  \node [bonus_box, below of=base, xshift=1.1cm] (bonus3) 
+    {Файлын холбоо\\+0.05};
+  
+  \node [bonus_box, below of=base, xshift=3.4cm] (bonus4) 
+    {Түлхүүрийн үг\\давхцал\\+0.05};
+  
+  % Sum/accumulation
+  \node [sum_box, below of=base, yshift=-3.2cm] (summation) 
+    {Бүх бонусийг\\нэмэх};
+  
+  % Final confidence
+  \node [final_box, below of=summation, yshift=-1.5cm] (final) 
+    {Эцсийн итгэл\\зэргүүдэл};
+  
+  % Connections from base to bonuses
+  \draw [->] (base) -- (bonus1);
+  \draw [->] (base) -- (bonus2);
+  \draw [->] (base) -- (bonus3);
+  \draw [->] (base) -- (bonus4);
+  
+  % Connections to summation
+  \draw [->] (bonus1) -- (summation);
+  \draw [->] (bonus2) -- (summation);
+  \draw [->] (bonus3) -- (summation);
+  \draw [->] (bonus4) -- (summation);
+  
+  % Final connection
+  \draw [->] (summation) -- (final);
+  
+  % Formula annotation
+  \node [below of=final, yshift=-1.2cm, text width=5cm, align=center, 
+         font=\small] {Томьёо: $confidence = base\_score + \sum bonuses$};
+  
+\end{tikzpicture}

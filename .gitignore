@@ -8,3 +8,9 @@ improve_ollama.py
 patch_direct.py
 profile_speed.py
 python speed_check.py
+*.personal_bak_*
+*.prompt_bak_*
+*.ranking_bak_*
+*.v2bak_*
+*.prefinal_*
+backup/
